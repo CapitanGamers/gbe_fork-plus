@@ -78,22 +78,28 @@ void KillableWorker::thread_proc(void *data)
     {
         std::unique_lock lck(kill_thread_mutex);
         this->kill_thread_acked = true;
+        this->kill_thread_cv.notify_one();
     }
-    this->kill_thread_cv.notify_one();
 }
 
 bool KillableWorker::start(void *data)
 {
+    std::lock_guard lifecycle_lock(lifecycle_mutex);
     if (!thread_job) return false; // no work to do
-    if (thread_obj.joinable()) return true; // alrady spawned
-    
-    kill_thread = false;
+    if (thread_obj.joinable()) return true;
+
+    {
+        std::lock_guard lock(kill_thread_mutex);
+        kill_thread = false;
+        kill_thread_acked = false;
+    }
     thread_obj = std::thread([this, data] { thread_proc(data); });
     return true;
 }
 
 void KillableWorker::kill()
 {
+    std::lock_guard lifecycle_lock(lifecycle_mutex);
     if (!thread_job || !thread_obj.joinable()) return; // already killed
     
     {

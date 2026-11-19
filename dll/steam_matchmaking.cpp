@@ -1717,7 +1717,8 @@ void Steam_Matchmaking::Callback(Common_Message *msg)
 
     if (msg->has_low_level()) {
         if (msg->low_level().type() == Low_Level::CONNECT) {
-            
+            // Publish existing lobbies on the next matchmaking tick for this newly connected peer.
+            last_sent_lobbies = {};
         }
 
         if (msg->low_level().type() == Low_Level::DISCONNECT) {

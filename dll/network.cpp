@@ -17,6 +17,9 @@
 
 #include "dll/network.h"
 #include "dll/dll.h"
+#include "common_helpers/peer_endpoints.hpp"
+
+#include <cerrno>
 
 #define MAX_BROADCASTS 16
 static int number_broadcasts = -1;
@@ -152,16 +155,10 @@ static void get_broadcast_info(uint16 port)
 static bool is_socket_valid(sock_t sock)
 {
 #if defined(STEAM_WIN32)
-
-    if (sock == (sock_t)INVALID_SOCKET || sock == (sock_t)~0) {
+    return sock != invalid_socket;
 #else
-
-    if (sock < 0) {
+    return sock >= 0;
 #endif
-        return false;
-    }
-
-    return true;
 }
 
 static bool is_tcp_socket_valid(struct TCP_Socket &socket)
@@ -236,7 +233,7 @@ static int get_last_error()
 #if defined(STEAM_WIN32)
     return WSAGetLastError();
 #else
-    return 0;
+    return errno;
 #endif
 }
 
@@ -288,49 +285,49 @@ static int receive_packet(sock_t sock, IP_PORT *ip_port, char *data, unsigned lo
     return -1;
 }
 
-static bool send_broadcasts(sock_t sock, uint16 port, char *data, unsigned long length, std::vector<IP_PORT> *custom_broadcasts)
+int Networking::receive_discovery_packet(IP_PORT &ip_port, char *data, unsigned long capacity, bool &broadcast)
+{
+    broadcast = false;
+#if defined(STEAM_WIN32)
+    if (udp_receive_message) {
+        sockaddr_in sender{};
+        WSABUF buffer{capacity, data};
+        WSAMSG message{};
+        message.name = reinterpret_cast<sockaddr *>(&sender);
+        message.namelen = sizeof(sender);
+        message.lpBuffers = &buffer;
+        message.dwBufferCount = 1;
+        DWORD received = 0;
+
+        if (udp_receive_message(udp_socket, &message, &received, nullptr, nullptr) == SOCKET_ERROR) return -1;
+        broadcast = (message.dwFlags & (MSG_BCAST | MSG_MCAST)) != 0;
+        ip_port = {sender.sin_addr.s_addr, sender.sin_port};
+        return static_cast<int>(received);
+    }
+#endif
+    return receive_packet(udp_socket, &ip_port, data, capacity);
+}
+
+static void send_broadcasts(sock_t sock, uint16 port, char *data, unsigned long length)
 {
     static std::chrono::high_resolution_clock::time_point last_get_broadcast_info;
     if (number_broadcasts < 0 || check_timedout(last_get_broadcast_info, 60.0)) {
         PRINT_DEBUG("get_broadcast_info");
         get_broadcast_info(port);
-        std::vector<uint32_t> lower_range(lower_range_ips, lower_range_ips + number_broadcasts), upper_range(upper_range_ips, upper_range_ips + number_broadcasts);
-        for(auto &addr : *custom_broadcasts) {
-            lower_range.push_back(addr.ip);
-            upper_range.push_back(addr.ip);
-        }
-
-        set_whitelist_ips(lower_range.data(), upper_range.data(), static_cast<unsigned int>(lower_range.size()));
+        set_whitelist_ips(lower_range_ips, upper_range_ips, static_cast<unsigned int>(number_broadcasts));
         last_get_broadcast_info = std::chrono::high_resolution_clock::now();
     }
 
     IP_PORT main_broadcast;
     main_broadcast.ip = INADDR_BROADCAST;
     main_broadcast.port = port;
-    int ret = send_packet_to(sock, main_broadcast, data, length);
-
-    if (!number_broadcasts)
-        return false;
+    send_packet_to(sock, main_broadcast, data, length);
 
     for (int i = 0; i < number_broadcasts; i++) {
         IP_PORT ip_port = broadcasts[i];
         ip_port.port = port;
-        ret = send_packet_to(sock, ip_port, data, length);
+        send_packet_to(sock, ip_port, data, length);
     }
-
-    /** 
-     * Custom targeted clients server broadcaster
-     * 
-     * Sends to custom IPs the broadcast packet
-     * This is useful in cases of undetected network interfaces
-     */
-    PRINT_DEBUG("start custom broadcasts");
-    for(auto &addr : *custom_broadcasts) {
-        send_packet_to(sock, addr, data, length);
-    }
-    PRINT_DEBUG("end custom broadcasts");
-
-    return true;
 }
 
 static void buffers_set(sock_t sock)
@@ -419,7 +416,7 @@ static unsigned long peek_buffer_tcp(struct TCP_Socket &socket)
     if (socket.recv_buffer.size() < sizeof(length)) return 0;
 
     memcpy(&length, &(socket.recv_buffer[0]), sizeof(length));
-    if (sizeof(length) + length > socket.recv_buffer.size()) return 0;
+    if (length > socket.recv_buffer.size() - sizeof(length)) return 0;
 
     return length;
 }
@@ -444,18 +441,20 @@ static bool unbuffer_tcp(struct TCP_Socket &socket, Common_Message *msg)
 
 static bool recv_tcp(struct TCP_Socket &socket)
 {
-    if (is_socket_valid(socket.sock)) {
-        unsigned int size = receive_buffer_amount(socket.sock), old_size = static_cast<uint32>(socket.recv_buffer.size());
-        int len;
-        socket.recv_buffer.resize(old_size + size);
-        if (size > 0) {
-            len = recv(socket.sock, &(socket.recv_buffer[old_size]), size, MSG_NOSIGNAL);
-            socket.received_data = true;
-            return true;
-        }
-    }
+    if (!is_tcp_socket_valid(socket)) return false;
 
-    return false;
+    const auto pending = receive_buffer_amount(socket.sock);
+    if (!pending) return false;
+
+    const auto requested = (std::min)(pending, 65536u);
+    const auto old_size = socket.recv_buffer.size();
+    socket.recv_buffer.resize(old_size + requested);
+    const auto length = recv(socket.sock, socket.recv_buffer.data() + old_size, requested, MSG_NOSIGNAL);
+    socket.recv_buffer.resize(old_size + (length > 0 ? length : 0));
+    if (length <= 0) return false;
+
+    socket.received_data = true;
+    return true;
 }
 
 static void socket_timeouts(struct TCP_Socket &socket, double extra_time)
@@ -652,6 +651,9 @@ struct Connection *Networking::new_connection(CSteamID search_id, uint32 appid)
 
 bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
 {
+    const CSteamID source_id(msg->source_id());
+    if (std::find(ids.begin(), ids.end(), source_id) != ids.end()) return false;
+
     Connection *conn = find_connection((uint64)msg->source_id(), msg->announce().appid());
     if (!conn || conn->appid != msg->announce().appid()) {
         conn = new_connection((uint64)msg->source_id(), msg->announce().appid());
@@ -660,6 +662,7 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
     }
 
     PRINT_DEBUG("Handle Announce: %u, " "%" PRIu64 ", %u, %u", conn->appid, msg->source_id(), msg->announce().appid(), msg->announce().type());
+    conn->announce_endpoint = ip_port;
     conn->tcp_ip_port = ip_port;
     conn->tcp_ip_port.port = htons(msg->announce().tcp_port());
     conn->appid = msg->announce().appid();
@@ -673,7 +676,9 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
         auto id_temp = std::find(ids.begin(), ids.end(), search_id);
         if (id_temp != ids.end()) {
             own_ip = ntohl(msg->announce().peers(i).ip());
+            continue;
         }
+        if (!automatic_discovery.load()) continue;
 
         Connection *conn = find_connection((uint64)msg->announce().peers(i).id(), msg->announce().peers(i).appid());
         PRINT_DEBUG("%p %u %u " "%" PRIu64 "", conn, conn ? conn->appid : (uint32)0, msg->announce().peers(i).appid(), msg->announce().peers(i).id());
@@ -694,7 +699,7 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
     conn->last_received = std::chrono::high_resolution_clock::now();
 
     if (msg->announce().type() == Announce::PING) {
-        Common_Message msg = create_announce(false);
+        Common_Message msg = create_announce(false, conn);
         size_t size = msg.ByteSizeLong(); 
         char *buffer = new char[size];
         msg.SerializeToArray(buffer, static_cast<int>(size));
@@ -740,41 +745,46 @@ bool Networking::handle_low_level_udp(Common_Message *msg, IP_PORT ip_port)
 #define NUM_TCP_WAITING 128
 
 Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT> *custom_broadcasts, bool disable_sockets)
+    : peer_file(steamem_peers::default_file()),
+      automatic_discovery(get_env_variable("STEAMEM_AUTOMATIC_DISCOVERY") == "1")
 {
     tcp_port = udp_port = port;
     own_ip = 0x7F000001;
     last_run = std::chrono::high_resolution_clock::now();
     this->appid = appid;
 
-    if (disable_sockets) {
-        enabled = false;
-        udp_socket = -1;
-        tcp_socket = -1;
-        return;
-    }
-
     if (custom_broadcasts) {
-        std::transform(custom_broadcasts->begin(), custom_broadcasts->end(), std::back_inserter(this->custom_broadcasts), [](IP_PORT addr) {addr.ip = htonl(addr.ip); addr.port = htons(addr.port); return addr; });
-        for (auto& addr : this->custom_broadcasts) {
-            if (addr.port == htons(0))
-                addr.port = htons(port);
+        for (const auto &addr : *custom_broadcasts) {
+            const IP_PORT target{htonl(addr.ip), htons(addr.port ? addr.port : port)};
+            peer_targets[target].legacy = true;
         }
     }
 
+    refresh_peer_file();
+    if (disable_sockets) return;
+
     run_at_startup();
     sock_t sock = static_cast<sock_t>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
-    PRINT_DEBUG("UDP socket: %u", sock);
+    PRINT_DEBUG("UDP socket: %llu", static_cast<unsigned long long>(sock));
     if (is_socket_valid(sock) && set_socket_nonblocking(sock)) {
         int broadcast = 1;
         setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char *)&broadcast, sizeof(broadcast));
         //socket_reuseaddr(sock);
 
         buffers_set(sock);
-        for (unsigned i = 0; i < 1000; ++i) {
+        for (unsigned i = 0; i < 1000 && port + i <= UINT16_MAX; ++i) {
             udp_port = port + i;
             if (bind_socket(sock, udp_port)) {
                 PRINT_DEBUG("UDP successful");
                 udp_socket = sock;
+#if defined(STEAM_WIN32)
+                GUID receive_id = WSAID_WSARECVMSG;
+                DWORD bytes = 0;
+                if (WSAIoctl(udp_socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &receive_id, sizeof(receive_id),
+                             &udp_receive_message, sizeof(udp_receive_message), &bytes, nullptr, nullptr) == SOCKET_ERROR) {
+                    udp_receive_message = nullptr;
+                }
+#endif
                 break;
             } else {
                 //clear the error
@@ -790,14 +800,15 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
     } else {
         PRINT_DEBUG("UDP: could not initialize %i", get_last_error());
     }
+    if (is_socket_valid(sock) && !is_socket_valid(udp_socket)) kill_socket(sock);
 
     sock = static_cast<sock_t>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
-    PRINT_DEBUG("TCP socket: %u", sock);
+    PRINT_DEBUG("TCP socket: %llu", static_cast<unsigned long long>(sock));
     if (is_socket_valid(sock) && set_socket_nonblocking(sock)) {
         buffers_set(sock);
         //socket_reuseaddr(sock);
 
-        for (unsigned i = 0; i < 1000; ++i) {
+        for (unsigned i = 0; i < 1000 && port + i <= UINT16_MAX; ++i) {
             tcp_port = port + i;
             if (bind_socket(sock, tcp_port)) {
                 if ((listen(sock, NUM_TCP_WAITING) == 0)) {
@@ -817,12 +828,13 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
             }
         }
 
-        if (!is_socket_valid(udp_socket)) {
+        if (!is_socket_valid(tcp_socket)) {
             PRINT_DEBUG("TCP: could not bind or listen");
         }
     } else {
         PRINT_DEBUG("TCP: could not initialize %i", get_last_error());
     }
+    if (is_socket_valid(sock) && !is_socket_valid(tcp_socket)) kill_socket(sock);
 
     if (curl_global_init(CURL_GLOBAL_ALL) == 0) {
         PRINT_DEBUG("CURL successful");
@@ -852,13 +864,14 @@ Networking::~Networking()
         kill_tcp_socket(c);
     }
 
-    kill_socket(udp_socket);
-    kill_socket(tcp_socket);
+    if (is_socket_valid(udp_socket)) kill_socket(udp_socket);
+    if (is_socket_valid(tcp_socket)) kill_socket(tcp_socket);
+    if (is_socket_valid(query_socket)) kill_socket(query_socket);
 
     curl_global_cleanup();
 }
 
-Common_Message Networking::create_announce(bool request)
+Common_Message Networking::create_announce(bool request, const Connection *recipient)
 {
     Announce *announce = new Announce();
     PRINT_DEBUG("ids length %zu", ids.size());
@@ -866,15 +879,22 @@ Common_Message Networking::create_announce(bool request)
         announce->set_type(Announce::PING);
     } else {
         announce->set_type(Announce::PONG);
-        for (auto &conn: connections) {
-            PRINT_DEBUG("Connection %u %llu %u", conn.udp_pinged, conn.ids[0].ConvertToUint64(), conn.appid);
-            if (conn.udp_pinged) {
-                Announce_Other_Peers *peer = announce->add_peers();
-                peer->set_id(conn.ids[0].ConvertToUint64());
-                peer->set_ip(conn.udp_ip_port.ip);
-                peer->set_udp_port(ntohs(conn.udp_ip_port.port));
-                peer->set_appid(conn.appid);
+
+        const auto add_endpoint = [&](const Connection &conn, const IP_PORT &endpoint) {
+            if (conn.ids.empty()) return;
+            Announce_Other_Peers *peer = announce->add_peers();
+            peer->set_id(conn.ids.front().ConvertToUint64());
+            peer->set_ip(endpoint.ip);
+            peer->set_udp_port(ntohs(endpoint.port));
+            peer->set_appid(conn.appid);
+        };
+        if (automatic_discovery.load()) {
+            for (const auto &conn : connections) {
+                if (conn.udp_pinged) add_endpoint(conn, conn.udp_ip_port);
             }
+        } else if (recipient) {
+            // Give a directly connected client its observed address without sharing a peer list.
+            add_endpoint(*recipient, recipient->announce_endpoint);
         }
     }
 
@@ -889,20 +909,35 @@ Common_Message Networking::create_announce(bool request)
 
 void Networking::send_announce_broadcasts()
 {
+    last_broadcast = std::chrono::high_resolution_clock::now();
     Common_Message msg = create_announce(true);
 
-    size_t size = msg.ByteSizeLong(); 
+    const auto size = msg.ByteSizeLong();
     std::vector<char> buffer(size);
-    msg.SerializeToArray(&buffer[0], static_cast<int>(size));
-    for (uint16 i = DEFAULT_PORT; i < DEFAULT_PORT + NUM_QUERY_PORTS; i++) {
-        send_broadcasts(udp_socket, htons(i), &buffer[0], static_cast<unsigned long>(size), &this->custom_broadcasts);
-    }
-    if (udp_port < DEFAULT_PORT || udp_port >= DEFAULT_PORT + NUM_QUERY_PORTS) {
-        send_broadcasts(udp_socket, htons(udp_port), &buffer[0], static_cast<unsigned long>(size), &this->custom_broadcasts);
+    if (!msg.SerializeToArray(buffer.data(), static_cast<int>(size))) return;
+
+    const bool include_automatic = automatic_discovery.load();
+    if (include_automatic) {
+        for (uint16 i = DEFAULT_PORT; i < DEFAULT_PORT + NUM_QUERY_PORTS; i++) {
+            send_broadcasts(udp_socket, htons(i), buffer.data(), static_cast<unsigned long>(size));
+        }
+        if (udp_port < DEFAULT_PORT || udp_port >= DEFAULT_PORT + NUM_QUERY_PORTS) {
+            send_broadcasts(udp_socket, htons(udp_port), buffer.data(), static_cast<unsigned long>(size));
+        }
     }
 
-    last_broadcast = std::chrono::high_resolution_clock::now();
-    PRINT_DEBUG("sent broadcasts");
+    // Send each configured destination once per announcement, independently of LAN broadcast support.
+    const std::lock_guard lock(peer_mutex);
+    std::set<uint32_t> peer_ips;
+    for (const auto &entry : peer_targets) peer_ips.insert(ntohl(entry.first.ip));
+    set_discovery_peer_ips(std::move(peer_ips));
+    for (auto &[endpoint, target] : peer_targets) {
+        if (!include_automatic && !target.editable) continue;
+        const auto sent = send_packet_to(udp_socket, endpoint, buffer.data(), static_cast<unsigned long>(size));
+        target.attempted = true;
+        target.socket_error = sent < 0 ? get_last_error() : 0;
+    }
+    PRINT_DEBUG("sent discovery messages, automatic discovery: %i", include_automatic);
 }
 
 void Networking::Run()
@@ -911,13 +946,15 @@ void Networking::Run()
     double time_extra = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_run).count();
     last_run = now;
 
-    if (!enabled || ids.size() == 0) {
+    const bool peers_changed = refresh_peer_file();
+    if (!enabled || ids.empty()) {
         return;
     }
 
     //PRINT_DEBUG("%lf", time_extra);
     // PRINT_DEBUG_ENTRY();
-    if (check_timedout(last_broadcast, BROADCAST_INTERVAL)) {
+    const bool mode_changed = discovery_mode_changed.exchange(false);
+    if (mode_changed || peers_changed || check_timedout(last_broadcast, BROADCAST_INTERVAL)) {
         send_announce_broadcasts();
     }
 
@@ -943,15 +980,15 @@ void Networking::Run()
         }
     }
 
-    // PRINT_DEBUG("RECV UDP");
-    while((len = receive_packet(udp_socket, &ip_port, data, sizeof(data))) >= 0) {
+    bool broadcast = false;
+    while ((len = receive_discovery_packet(ip_port, data, sizeof(data), broadcast)) >= 0) {
         PRINT_DEBUG("recv UDP %i %hhu.%hhu.%hhu.%hhu:%hu", len,
             ((unsigned char *)&ip_port.ip)[0], ((unsigned char *)&ip_port.ip)[1], ((unsigned char *)&ip_port.ip)[2], ((unsigned char *)&ip_port.ip)[3], htons(ip_port.port));
         Common_Message msg;
         if (msg.ParseFromArray(data, len)) {
             if (msg.source_id()) {
                 if (msg.has_announce()) {
-                    handle_announce(&msg, ip_port);
+                    if (!broadcast || automatic_discovery.load()) handle_announce(&msg, ip_port);
                 } else if (msg.has_low_level()) {
                     handle_low_level_udp(&msg, ip_port);
                 } else {
@@ -968,30 +1005,14 @@ void Networking::Run()
     local_send.clear();
 
     for (auto & m: local_send_copy) {
-        m.set_source_ip(ntohl(own_ip));
-        m.set_source_port(ntohs(udp_port));
+        m.set_source_ip(own_ip);
+        m.set_source_port(udp_port);
         do_callbacks_message(&m);
     }
 
-    struct sockaddr_storage addr;
-#if defined(STEAM_WIN32)
-    int addrlen = sizeof(addr);
-#else
-    socklen_t addrlen = sizeof(addr);
-#endif
     sock_t sock;
-    // PRINT_DEBUG("ACCEPTING");
-    while (is_socket_valid(sock = static_cast<sock_t>(accept(tcp_socket, (struct sockaddr *)&addr, &addrlen)))) {
-        PRINT_DEBUG("ACCEPT SOCKET %u", sock);
-        struct sockaddr_storage addr;
-    #if defined(STEAM_WIN32)
-        int addrlen = sizeof(addr);
-    #else
-        socklen_t addrlen = sizeof(addr);
-    #endif
-        struct sockaddr_in *addr_in = (struct sockaddr_in *)&addr;
-        ip_port.ip = addr_in->sin_addr.s_addr;
-        ip_port.port = addr_in->sin_port;
+    while (is_socket_valid(sock = accept(tcp_socket, nullptr, nullptr))) {
+        PRINT_DEBUG("ACCEPT SOCKET %llu", static_cast<unsigned long long>(sock));
         struct TCP_Socket socket;
         if (set_socket_nonblocking(sock)) {
             PRINT_DEBUG("SET NONBLOCK");
@@ -1000,7 +1021,9 @@ void Networking::Run()
             socket.received_data = true;
             socket.last_heartbeat_received = std::chrono::high_resolution_clock::now();
             accepted.push_back(socket);
-            PRINT_DEBUG("TCP ACCEPTED %u", sock);
+            PRINT_DEBUG("TCP ACCEPTED %llu", static_cast<unsigned long long>(sock));
+        } else {
+            kill_socket(sock);
         }
     }
 
@@ -1048,7 +1071,8 @@ void Networking::Run()
         if (!is_tcp_socket_valid(conn.tcp_socket_outgoing)) {
             sock = static_cast<sock_t>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
             if (is_socket_valid(sock) && set_socket_nonblocking(sock)) {
-                PRINT_DEBUG("NEW SOCKET %u %u", sock, conn.tcp_socket_outgoing.sock);
+                PRINT_DEBUG("NEW SOCKET %llu %llu", static_cast<unsigned long long>(sock),
+                            static_cast<unsigned long long>(conn.tcp_socket_outgoing.sock));
                 disable_nagle(sock);
                 connect_socket(sock, conn.tcp_ip_port);
                 conn.tcp_socket_outgoing.sock = sock;
@@ -1056,6 +1080,8 @@ void Networking::Run()
                 Common_Message msg;
                 msg.set_source_id(ids[0].ConvertToUint64());
                 send_buffer_tcp(conn.tcp_socket_outgoing, &msg);
+            } else if (is_socket_valid(sock)) {
+                kill_socket(sock);
             }
         }
 
@@ -1135,6 +1161,7 @@ void Networking::Run()
         }
     }
 
+    update_peer_discovery();
     reset_last_error();
 }
 
@@ -1159,20 +1186,24 @@ void Networking::setAppID(uint32 appid)
 
 bool Networking::sendToIPPort(Common_Message *msg, uint32 ip, uint16 port, bool reliable)
 {
+    if (!enabled || ids.empty()) return false;
+
     bool is_local_ip = ((ip >> 24) == 0x7F);
     uint32_t local_ip = getIP(ids.front());
     PRINT_DEBUG("%X %u %X", ip, is_local_ip, local_ip);
-    //TODO: actually send to ip/port
+    // The game port is part of the payload. It need not match the emulator's transport ports.
+    (void)port;
+    bool sent = false;
     for (auto &conn: connections) {
         if (ntohl(conn.tcp_ip_port.ip) == ip || (is_local_ip && ntohl(conn.tcp_ip_port.ip) == local_ip)) {
             for (auto &steam_id : conn.ids) {
                 msg->set_dest_id(steam_id.ConvertToUint64());
-                sendTo(msg, reliable, &conn);
+                sent = sendTo(msg, reliable, &conn) || sent;
             }
         }
     }
 
-    return true;
+    return sent;
 }
 
 uint32 Networking::getIP(CSteamID id)
@@ -1407,10 +1438,184 @@ void Networking::startQuery(IP_PORT ip_port)
 void Networking::shutDownQuery()
 {
     query_alive = false;
-    kill_socket(query_socket);
+    if (is_socket_valid(query_socket)) kill_socket(query_socket);
+    query_socket = invalid_socket;
 }
 
 bool Networking::isQueryAlive()
 {
     return query_alive;
 }
+
+bool Networking::refresh_peer_file()
+{
+    if (peer_file.empty()) return false;
+    {
+        const std::lock_guard lock(peer_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_peer_refresh) return false;
+        next_peer_refresh = now + std::chrono::seconds(1);
+    }
+
+    std::vector<steamem_peers::Endpoint> configured;
+    std::string error;
+    if (!steamem_peers::read(peer_file, configured, error)) {
+        PRINT_DEBUG("Peer settings refresh failed: %s", error.c_str());
+        return false;
+    }
+
+    std::set<IP_PORT> shared_targets;
+    for (const auto &entry : configured) {
+        shared_targets.insert({htonl(entry.address), htons(entry.port)});
+    }
+
+    bool changed = false;
+    const std::lock_guard lock(peer_mutex);
+    for (const auto &address : shared_targets) {
+        auto [peer, added] = peer_targets.try_emplace(address);
+        peer->second.editable = true;
+        changed = changed || added;
+    }
+    for (auto peer = peer_targets.begin(); peer != peer_targets.end();) {
+        if (peer->second.editable && !shared_targets.count(peer->first)) {
+            peer->second.editable = false;
+            if (!peer->second.legacy) {
+                peer = peer_targets.erase(peer);
+                changed = true;
+                continue;
+            }
+        }
+        ++peer;
+    }
+    return changed;
+}
+
+void Networking::update_peer_discovery()
+{
+    const std::lock_guard lock(peer_mutex);
+    manual_users.clear();
+    for (auto &[address, peer] : peer_targets) {
+        const auto found = std::find_if(connections.cbegin(), connections.cend(), [&](const Connection &conn) {
+            return conn.appid == appid && conn.announce_endpoint.ip == address.ip &&
+                   conn.announce_endpoint.port == address.port;
+        });
+        if (found != connections.cend()) {
+            peer.state = found->connected ? PeerDiscoveryState::Connected : PeerDiscoveryState::Discovered;
+            if (peer.editable && found->connected) {
+                for (auto id : found->ids) {
+                    if (id.BIndividualAccount()) manual_users.push_back(id);
+                }
+            }
+        } else if (peer.socket_error) {
+            peer.state = PeerDiscoveryState::SendFailed;
+        } else {
+            peer.state = peer.attempted ? PeerDiscoveryState::Searching : PeerDiscoveryState::Waiting;
+        }
+    }
+    std::sort(manual_users.begin(), manual_users.end());
+    manual_users.erase(std::unique(manual_users.begin(), manual_users.end()), manual_users.end());
+}
+
+bool Networking::add_custom_endpoint(std::string_view endpoint, std::string &error)
+{
+    steamem_peers::Endpoint address;
+    if (!steamem_peers::parse(endpoint, address, error) || !steamem_peers::add(peer_file, address, error)) {
+        return false;
+    }
+
+    const std::lock_guard lock(peer_mutex);
+    next_peer_refresh = {};
+    return true;
+}
+
+bool Networking::remove_custom_endpoint(std::string_view endpoint, std::string &error)
+{
+    steamem_peers::Endpoint address;
+    if (!steamem_peers::parse(endpoint, address, error) || !steamem_peers::remove(peer_file, address, error)) {
+        return false;
+    }
+
+    const std::lock_guard lock(peer_mutex);
+    next_peer_refresh = {};
+    return true;
+}
+
+void Networking::set_automatic_discovery(bool enabled)
+{
+    if (automatic_discovery.exchange(enabled) != enabled) discovery_mode_changed.store(true);
+}
+
+PeerDiscoverySnapshot Networking::peer_discovery_snapshot() const
+{
+    PeerDiscoverySnapshot snapshot{};
+    snapshot.enabled = enabled;
+    snapshot.automatic_discovery = automatic_discovery.load();
+    snapshot.udp_port = is_socket_valid(udp_socket) ? udp_port : 0;
+    snapshot.tcp_port = is_socket_valid(tcp_socket) ? tcp_port : 0;
+
+    const std::lock_guard lock(peer_mutex);
+    snapshot.manual_users = manual_users;
+    snapshot.peers.reserve(peer_targets.size());
+    for (const auto &[address, peer] : peer_targets) {
+        if (!snapshot.automatic_discovery && !peer.editable) continue;
+        snapshot.peers.push_back({steamem_peers::format({ntohl(address.ip), ntohs(address.port)}),
+                                  peer.state, peer.socket_error, peer.editable});
+    }
+    return snapshot;
+}
+
+std::vector<std::string> Networking::get_local_vpn_ips()
+{
+    std::vector<std::string> result;
+#ifdef __WINDOWS__
+    ULONG bufLen = 32768;
+    std::vector<uint8_t> buffer(bufLen);
+    PIP_ADAPTER_ADDRESSES pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+    ULONG result_code = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, pAddresses, &bufLen);
+    if (result_code == ERROR_BUFFER_OVERFLOW) {
+        buffer.resize(bufLen);
+        pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+        result_code = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, pAddresses, &bufLen);
+    }
+    if (result_code == NO_ERROR) {
+        for (PIP_ADAPTER_ADDRESSES pCurr = pAddresses; pCurr; pCurr = pCurr->Next) {
+            if (pCurr->OperStatus != IfOperStatusUp || pCurr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            for (PIP_ADAPTER_UNICAST_ADDRESS pUni = pCurr->FirstUnicastAddress; pUni; pUni = pUni->Next) {
+                if (!pUni->Address.lpSockaddr || pUni->Address.lpSockaddr->sa_family != AF_INET) continue;
+                sockaddr_in* sa = reinterpret_cast<sockaddr_in*>(pUni->Address.lpSockaddr);
+                char ip_str[INET_ADDRSTRLEN]{};
+                if (inet_ntop(AF_INET, &(sa->sin_addr), ip_str, sizeof(ip_str))) {
+                    result.emplace_back(ip_str);
+                }
+            }
+        }
+    }
+#endif
+    return result;
+}
+
+// Room key cipher
+static std::string& get_network_room_key() {
+    static std::string key;
+    static bool initialized = false;
+    if (!initialized) {
+        const char* env = getenv("GSE_ROOM_KEY");
+        if (env) key = env;
+        initialized = true;
+    }
+    return key;
+}
+
+static void transform_packet_cipher(char *data, unsigned long length) {
+    const std::string& key = get_network_room_key();
+    if (key.empty() || !data || length == 0) return;
+    uint32_t state = 0x811C9DC5u;
+    for (char c : key) state = (state ^ static_cast<uint8_t>(c)) * 0x01000193u;
+    for (unsigned long i = 0; i < length; ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        data[i] ^= static_cast<char>((state ^ key[i % key.size()]) & 0xFF);
+    }
+}
+// ===================== END NETWORK FUNCTIONS =====================

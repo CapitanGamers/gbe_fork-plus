@@ -42,14 +42,16 @@ void Steam_Client::background_thread_proc()
     // if our time exceeds last run time of callbacks and it wasn't processing already
     const auto runcallbacks_timeout_ms = last_cb_run + max_stall_ms.count();
     if (!cb_run_active && (now_ms >= runcallbacks_timeout_ms)) {
-        std::lock_guard lock(global_mutex);
+        // Shutdown can hold global_mutex while waiting for this worker to exit.
+        std::unique_lock lock(global_mutex, std::try_to_lock);
+        if (lock.owns_lock()) {
+            PRINT_DEBUG("run @@@@@@@@@@@@@@@@@@@@@@@@@@@");
+            network->Run(); // networking must run first since it receives messages used by each run_callback()
+            run_every_runcb->run(); // call each run_callback()
 
-        PRINT_DEBUG("run @@@@@@@@@@@@@@@@@@@@@@@@@@@");
-        network->Run(); // networking must run first since it receives messages used by each run_callback()
-        run_every_runcb->run(); // call each run_callback()
-
-        // update the time counter to avoid overlap
-        last_cb_run = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            // update the time counter to avoid overlap
+            last_cb_run = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
     }
 
     if (settings_client->record_playtime) {
@@ -202,6 +204,7 @@ Steam_Client::~Steam_Client()
 
     // background thread first to avoid unwanted racing
     DEL_INST(background_thread);
+    if (steam_overlay) steam_overlay->UnSetupOverlay();
 
     // ----------------------------------
     // destroy everything else in reverse

@@ -1,0 +1,20 @@
+LIBRARY "XGameRuntime"
+EXPORTS
+    XGameRuntimeInitialize
+    XGameRuntimeUninitialize
+    XTaskQueueCreate
+    XTaskQueueCloseHandle
+    XTaskQueueDispatch
+    XTaskQueueSubmitCallback
+    XUserAddAsync
+    XUserAddResult
+    XUserCloseHandle
+    XUserGetId
+    XUserGetGamertag
+    XUserGetState
+    XGameSaveInitializeProvider
+    XGameSaveCloseProvider
+    XStoreCreateContext
+    XStoreCloseContextHandle
+    XStoreQueryGameLicenseAsync
+    XStoreQueryGameLicenseResult

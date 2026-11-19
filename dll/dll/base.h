@@ -56,6 +56,8 @@ bool file_exists_(const std::string &full_path);
 unsigned int file_size_(const std::string &full_path);
 
 void set_whitelist_ips(uint32_t *from, uint32_t *to, unsigned num_ips);
+void add_whitelist_ip_range(uint32_t ip_from_host, uint32_t ip_to_host);
+void set_discovery_peer_ips(std::set<uint32_t> ip_addresses);
 
 inline int get_old_interface_ver(const char *interface_name)
 {

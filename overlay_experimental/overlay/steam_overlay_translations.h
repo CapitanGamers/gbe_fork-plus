@@ -2,7 +2,7 @@
 #define _STEAM_OVERLAY_TRANSLATIONS_H
 
 
-const int TRANSLATION_NUMBER_OF_LANGUAGES = 31;
+const int TRANSLATION_NUMBER_OF_LANGUAGES = 32;
 const int TRANSLATION_BUFFER_SIZE = 256;
 
 // C:\Program Files (x86)\Steam\tenfoot\resource\localization\tenfoot_*.txt

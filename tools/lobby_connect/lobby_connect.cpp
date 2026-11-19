@@ -48,7 +48,11 @@ int main() {
     set_env_variable("SteamAppId", appid_str);
     set_env_variable("SteamGameId", appid_str);
 
-    if (!SteamAPI_Init()) {
+    const auto prior_discovery_mode = get_env_variable("STEAMEM_AUTOMATIC_DISCOVERY");
+    set_env_variable("STEAMEM_AUTOMATIC_DISCOVERY", "1");
+    const bool initialized = SteamAPI_Init();
+    set_env_variable("STEAMEM_AUTOMATIC_DISCOVERY", prior_discovery_mode);
+    if (!initialized) {
         return 1;
     }
     

@@ -16,6 +16,8 @@
 #include "InGameOverlay/ImGui/imgui.h"
 #include "overlay/steam_overlay_stats.h"
 
+struct PeerDiscoverySnapshot;
+
 static constexpr size_t max_chat_len = 768;
 
 enum window_state
@@ -128,7 +130,7 @@ class Steam_Overlay
     // friend id, show client window (to chat and accept invite maybe)
     std::map<Friend, friend_window_state, Friend_Less> friends{};
 
-    bool is_ready = false;
+    std::atomic<bool> is_ready = false;
 
     ENotificationPosition notif_position = ENotificationPosition::k_EPositionBottomLeft;
     int h_inset = 0;
@@ -138,15 +140,23 @@ class Steam_Overlay
     std::vector<Overlay_Achievement> achievements{};
     size_t last_loaded_ach_icon{};
     
-    bool show_overlay = false;
+    std::atomic<bool> show_overlay = false;
+    std::atomic<bool> overlay_requested = false;
     bool show_user_info = false;
     bool show_achievements = false;
-    bool show_settings = false;
 
     // warn when using local save
     bool warn_local_save = false;
     // warn when app ID = 0
     bool warn_bad_appid = false;
+
+    enum class OverlayPage { Friends, Network, Achievements, Activity, Settings };
+    OverlayPage active_page = OverlayPage::Friends;
+    char peer_address[64]{};
+    char peer_port[16]{};
+    std::string peer_action_error;
+    std::vector<std::string> local_addresses;
+    std::chrono::steady_clock::time_point refresh_local_addresses_at{};
 
     char username_text[256]{};
     std::atomic<bool> save_settings = false;
@@ -197,6 +207,11 @@ class Steam_Overlay
 
     common_helpers::KillableWorker renderer_detector_delay_thread{};
     common_helpers::KillableWorker renderer_hook_init_thread{};
+    bool renderer_detector_active = false;
+    std::atomic<bool> renderer_hook_installed = false;
+    bool startup_ready_logged = false;
+    std::string displayed_local_name;
+    uint32 displayed_app_id = 0;
 
     std::vector<InGameOverlay::ToggleKey> toggle_keys{};
     std::vector<InGameOverlay::ToggleKey> screenshot_keys{};
@@ -292,6 +307,7 @@ class Steam_Overlay
     ImVector<ImWchar> ranges{};
 
     std::recursive_mutex overlay_mutex{};
+    std::mutex overlay_lifecycle_mutex{};
     std::atomic<bool> setup_overlay_called = false;
 
     std::map<std::string, std::vector<char>> wav_files{
@@ -363,6 +379,7 @@ class Steam_Overlay
     
     void request_renderer_detector();
     void cleanup_renderer_hook();
+    void log_overlay_startup(const char *message) const;
     bool renderer_hook_proc();
     
     // note: make sure to load all relevant strings before creating the font(s), otherwise some glyphs ranges will be missing
@@ -380,7 +397,7 @@ class Steam_Overlay
     void add_chat_message_notification(std::string const& message);
     void show_test_achievement();
 
-    bool open_overlay_hook(bool toggle);
+    void toggle_overlay_request();
 
     bool try_load_ach_icon(Overlay_Achievement &ach, bool achieved, bool upload_new_icon_to_gpu);
 
@@ -388,6 +405,9 @@ class Steam_Overlay
     void load_next_ach_icon();
     uint32 apply_global_style_color();
     void render_main_window();
+    void render_friends_page(const PeerDiscoverySnapshot& discovery);
+    void render_network_page(const PeerDiscoverySnapshot& discovery);
+    void render_overlay_controls();
 
 
     void steam_run_callback_update_my_lobby();

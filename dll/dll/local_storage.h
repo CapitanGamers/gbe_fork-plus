@@ -69,7 +69,9 @@ public:
 
 private:
     std::string save_directory{};
+    mutable std::mutex appid_mutex{};
     std::string appid{}; // game appid
+    std::string get_app_save_directory() const;
     
 public:
     Local_Storage(const std::string &save_directory);

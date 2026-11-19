@@ -1,32 +1,113 @@
-# IDE
-**/.vs
-**/.vscode
+# Build output and locally provisioned dependencies
+/build/
+/out/
+/dist/
+/release/
+/releases/
+/artifacts/
+/packages/
+/build_gbe.ps1
+/proto_gen/
+/third-party/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+*.exp
+*.lib
+*.a
+*.dll
+*.dylib
+*.so
+*.so.*
+*.exe
+*.msi
+*.msix
+*.appx
 
-# PYTHON
-**/.venv
-**/__pycache__
+# Upstream build inputs and release examples
+!/resources/win/file_dos_stub/file_dos_stub_x32.exe
+!/resources/win/file_dos_stub/file_dos_stub_x64.exe
+!/post_build/win/ColdClientLoader.EXAMPLE/extra_dlls.EXAMPLE/**/*.dll
 
-# PROTOBUF
-/proto_gen
+# IDEs, Python environments, and OS metadata
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+.venv/
+__pycache__/
+*.py[cod]
+Thumbs.db
+Desktop.ini
+.DS_Store
 
-# SPECIFIC
-/build
-/third-party
+# Local configuration, profiles, and credentials
+/.local/
+/local/
+/personal/
+/private/
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local.ini
+*.local.json
+*.pfx
+*.p12
+*.key
+*.pem
+*.keystore
+steam_settings/
+GSE Saves/
+/saves/
+custom_broadcasts.txt
+epic_lan_endpoints.txt
+steam_appid.txt
 
-# TOOLS
+# Logs, crash dumps, and packet captures
+*.log
+*.dmp
+*.mdmp
+*.pcap
+*.pcapng
+/captures/
+/build_log_*.txt
 
-# generate_emu_config
+# Local backups, folder exports, and obsolete integration notes
+/backup/
+/backups/
+/*.zip
+/*.rar
+/*.7z
+/*.tar
+/*.tar.gz
+/*.tgz
+*.bak
+/FolderScanner.ps1
+/Folder_Contents_Rep2ort.txt
+/Folder_Cont2ents_Report.txt
+/dll/dll.txt
+/overlay_experimental/Overlay.txt
+/overlay_experimental/ov2.txt
+/PROJECT_AUDIT.fa.md
+/INTEGRATION_GUIDE.md
+
+# Tool environments and generated data
 /tools/generate_emu_config/.py*/
 /tools/generate_emu_config/.env*/
-/tools/generate_emu_config/bin
-
+/tools/generate_emu_config/bin/
 /tools/generate_emu_config/backup/
 /tools/generate_emu_config/login_temp/
 /tools/generate_emu_config/output/
 /tools/generate_emu_config/**/my_login.txt
 /tools/generate_emu_config/top_owners_ids.txt
-
-# migrate_gse
 /tools/migrate_gse/.py*/
 /tools/migrate_gse/.env*/
-/tools/migrate_gse/bin
+/tools/migrate_gse/bin/

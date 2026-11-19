@@ -20,15 +20,22 @@
 
 #include "base.h"
 #include <curl/curl.h>
+#include <atomic>
+#include <filesystem>
+#include <map>
+#include <string_view>
 
 #define DEFAULT_PORT 47584
 #define NUM_QUERY_PORTS 10
 
 #if defined(STEAM_WIN32)
-typedef unsigned int sock_t;
+#include <mswsock.h>
+typedef SOCKET sock_t;
 #else
 typedef int sock_t;
 #endif
+
+inline constexpr sock_t invalid_socket = static_cast<sock_t>(-1);
 
 static inline bool protobuf_message_equal(
     const google::protobuf::MessageLite& msg_a,
@@ -78,7 +85,7 @@ struct Network_Callback_Container {
 };
 
 struct TCP_Socket {
-    sock_t sock = static_cast<sock_t>(~0);
+    sock_t sock = invalid_socket;
     bool received_data = false;
     std::vector<char> recv_buffer{};
     std::vector<char> send_buffer{};
@@ -88,6 +95,7 @@ struct TCP_Socket {
 struct Connection {
     struct TCP_Socket tcp_socket_outgoing{}, tcp_socket_incoming{};
     bool connected = false;
+    IP_PORT announce_endpoint{};
     IP_PORT udp_ip_port{};
     bool udp_pinged = false;
     IP_PORT tcp_ip_port{};
@@ -96,12 +104,41 @@ struct Connection {
     std::chrono::high_resolution_clock::time_point last_received{};
 };
 
+enum class PeerDiscoveryState {
+    Waiting,
+    Searching,
+    Discovered,
+    Connected,
+    SendFailed,
+};
+
+struct PeerDiscoveryEntry {
+    std::string endpoint;
+    PeerDiscoveryState state;
+    int socket_error;
+    bool editable;
+};
+
+struct PeerDiscoverySnapshot {
+    bool enabled;
+    bool automatic_discovery;
+    uint16 udp_port;
+    uint16 tcp_port;
+    std::vector<PeerDiscoveryEntry> peers;
+    std::vector<CSteamID> manual_users;
+};
+
 class Networking
 {
     bool enabled = false;
     bool query_alive{};
     std::chrono::high_resolution_clock::time_point last_run{};
-    sock_t query_socket, udp_socket{}, tcp_socket{};
+    sock_t query_socket = invalid_socket;
+    sock_t udp_socket = invalid_socket;
+    sock_t tcp_socket = invalid_socket;
+#if defined(STEAM_WIN32)
+    LPFN_WSARECVMSG udp_receive_message = nullptr;
+#endif
     uint16 udp_port{}, tcp_port{};
     uint32 own_ip{};
     std::vector<struct Connection> connections{};
@@ -109,10 +146,22 @@ class Networking
     std::vector<CSteamID> ids;
     uint32 appid;
     std::chrono::high_resolution_clock::time_point last_broadcast;
-    std::vector<IP_PORT> custom_broadcasts;
+    struct PeerTarget {
+        PeerDiscoveryState state = PeerDiscoveryState::Waiting;
+        bool attempted = false;
+        int socket_error = 0;
+        bool legacy = false;
+        bool editable = false;
+    };
+    const std::filesystem::path peer_file;
+    mutable std::mutex peer_mutex;
+    std::map<IP_PORT, PeerTarget> peer_targets;
+    std::vector<CSteamID> manual_users;
+    std::chrono::steady_clock::time_point next_peer_refresh{};
+    std::atomic<bool> automatic_discovery{false};
+    std::atomic<bool> discovery_mode_changed{false};
 
     std::vector<struct TCP_Socket> accepted;
-    std::recursive_mutex mutex;
 
     struct Network_Callback_Container callbacks[CALLBACK_IDS_MAX];
     std::vector<Common_Message> local_send;
@@ -123,14 +172,17 @@ class Networking
     bool handle_announce(Common_Message *msg, IP_PORT ip_port);
     bool handle_low_level_udp(Common_Message *msg, IP_PORT ip_port);
     bool handle_tcp(Common_Message *msg, struct TCP_Socket &socket);
+    int receive_discovery_packet(IP_PORT &ip_port, char *data, unsigned long capacity, bool &broadcast);
     void send_announce_broadcasts();
+    bool refresh_peer_file();
+    void update_peer_discovery();
 
     bool add_id_connection(struct Connection *connection, CSteamID steam_id);
     void run_callbacks(Callback_Ids id, Common_Message *msg);
     void run_callback_user(CSteamID steam_id, bool online, uint32 appid);
     void do_callbacks_message(Common_Message *msg);
 
-    Common_Message create_announce(bool request);
+    Common_Message create_announce(bool request, const Connection *recipient = nullptr);
 
 
 public:
@@ -157,8 +209,8 @@ public:
     // send to all active/current connections, no need to call set_dest_id(), this is done automatically
     bool sendToAll(Common_Message *msg, bool reliable);
     
-    // send to active/current connections with specific ip/port, no need to call set_dest_id(), this is done automatically
-    //TODO: actually send to ip/port
+    // Route an emulated game socket message to already discovered peers at this IP.
+    // The game port is carried in the message and is separate from the discovery port.
     bool sendToIPPort(Common_Message *msg, uint32 ip, uint16 port, bool reliable);
 
     bool setCallback(Callback_Ids id, CSteamID steam_id, void (*message_callback)(void *object, Common_Message *msg), void *object);
@@ -169,6 +221,11 @@ public:
     uint32 getOwnIP();
 
     void startQuery(IP_PORT ip_port);
+    bool add_custom_endpoint(std::string_view endpoint, std::string &error);
+    bool remove_custom_endpoint(std::string_view endpoint, std::string &error);
+    void set_automatic_discovery(bool enabled);
+    PeerDiscoverySnapshot peer_discovery_snapshot() const;
+    std::vector<std::string> get_local_vpn_ips();
     void shutDownQuery();
     bool isQueryAlive();
 };

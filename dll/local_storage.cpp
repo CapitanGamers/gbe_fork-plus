@@ -570,7 +570,14 @@ const std::string& Local_Storage::get_current_save_directory() const
 
 void Local_Storage::setAppId(uint32 appid)
 {
+    const std::lock_guard lock(appid_mutex);
     this->appid = std::to_string(appid) + PATH_SEPARATOR;
+}
+
+std::string Local_Storage::get_app_save_directory() const
+{
+    const std::lock_guard lock(appid_mutex);
+    return save_directory + appid;
 }
 
 int Local_Storage::store_file_data(std::string folder, std::string file, const char *data, unsigned int length)
@@ -601,7 +608,7 @@ int Local_Storage::store_file_data(std::string folder, std::string file, const c
 
 std::string Local_Storage::get_path(std::string folder)
 {
-    std::string path(save_directory + appid + folder);
+    std::string path(get_app_save_directory() + folder);
     create_directory(path);
     return path;
 }
@@ -611,7 +618,7 @@ bool Local_Storage::dir_exists(std::string folder)
     if (folder.size() && folder.back() != *PATH_SEPARATOR) {
         folder.append(PATH_SEPARATOR);
     }
-    return common_helpers::dir_exist(save_directory + appid + folder);
+    return common_helpers::dir_exist(get_app_save_directory() + folder);
 }
 
 std::string Local_Storage::get_global_settings_path()
@@ -672,7 +679,7 @@ int Local_Storage::store_data(std::string folder, std::string file, char *data, 
         folder.append(PATH_SEPARATOR);
     }
 
-    return store_file_data(save_directory + appid + folder, file, data, length);
+    return store_file_data(get_app_save_directory() + folder, file, data, length);
 }
 
 int Local_Storage::store_data_settings(std::string file, const char *data, unsigned int length)
@@ -701,7 +708,7 @@ int Local_Storage::get_data(std::string folder, std::string file, char *data, un
         folder.append(PATH_SEPARATOR);
     }
 
-    std::string full_path(save_directory + appid + folder + file);
+    std::string full_path(get_app_save_directory() + folder + file);
     return get_file_data(full_path, data, max_length, offset);
 }
 
@@ -725,7 +732,7 @@ int Local_Storage::count_files(std::string folder)
         folder.append(PATH_SEPARATOR);
     }
 
-    return static_cast<int>(get_filenames_recursive(save_directory + appid + folder).size());
+    return static_cast<int>(get_filenames_recursive(get_app_save_directory() + folder).size());
 }
 
 bool Local_Storage::file_exists(std::string folder, std::string file)
@@ -735,7 +742,7 @@ bool Local_Storage::file_exists(std::string folder, std::string file)
         folder.append(PATH_SEPARATOR);
     }
 
-    std::string full_path(save_directory + appid + folder + file);
+    std::string full_path(get_app_save_directory() + folder + file);
     return file_exists_(full_path);
 }
 
@@ -746,7 +753,7 @@ unsigned int Local_Storage::file_size(std::string folder, std::string file)
         folder.append(PATH_SEPARATOR);
     }
 
-    std::string full_path(save_directory + appid + folder + file);
+    std::string full_path(get_app_save_directory() + folder + file);
     return file_size_(full_path);
 }
 
@@ -757,7 +764,7 @@ bool Local_Storage::file_delete(std::string folder, std::string file)
         folder.append(PATH_SEPARATOR);
     }
 
-    std::string full_path(save_directory + appid + folder + file);
+    std::string full_path(get_app_save_directory() + folder + file);
 #if defined(STEAM_WIN32)
     return _wremove(utf8_decode(full_path).c_str()) == 0;
 #else
@@ -772,7 +779,7 @@ uint64_t Local_Storage::file_timestamp(std::string folder, std::string file)
         folder.append(PATH_SEPARATOR);
     }
 
-    std::string full_path(save_directory + appid + folder + file);
+    std::string full_path(get_app_save_directory() + folder + file);
 
 #if defined(STEAM_WIN32)
     struct _stat buffer = {};
@@ -793,7 +800,7 @@ bool Local_Storage::iterate_file(std::string folder, int index, std::string &out
         folder.append(PATH_SEPARATOR);
     }
 
-    std::vector<struct File_Data> files = get_filenames_recursive(save_directory + appid + folder);
+    std::vector<struct File_Data> files = get_filenames_recursive(get_app_save_directory() + folder);
     if (index < 0 || static_cast<size_t>(index) >= files.size()) return false;
 
     std::string name(desanitize_file_name(files[index].name));
@@ -809,7 +816,8 @@ bool Local_Storage::iterate_file(std::string folder, int index, std::string &out
 
 bool Local_Storage::update_save_filenames(std::string folder)
 {
-    std::vector<struct File_Data> files = get_filenames_recursive(save_directory + appid + folder);
+    const auto directory = get_app_save_directory() + folder;
+    std::vector<struct File_Data> files = get_filenames_recursive(directory);
 
     for (auto &f : files) {
         std::string path(f.name);
@@ -820,8 +828,8 @@ bool Local_Storage::update_save_filenames(std::string folder)
             store_data(folder, to, (char *)"", 0);
             file_delete(folder, to);
 
-            std::string from(save_directory + appid + folder + PATH_SEPARATOR + path);
-            to = save_directory + appid + folder + PATH_SEPARATOR + to;
+            std::string from(directory + PATH_SEPARATOR + path);
+            to = directory + PATH_SEPARATOR + to;
             PRINT_DEBUG("renaming '%s' to '%s'", from.c_str(), to.c_str());
             if (std::rename(from.c_str(), to.c_str()) < 0) {
                 PRINT_DEBUG("ERROR RENAMING");
@@ -858,7 +866,7 @@ bool Local_Storage::load_json_file(std::string folder, std::string const&file, n
     if (!folder.empty() && folder.back() != *PATH_SEPARATOR) {
         folder.append(PATH_SEPARATOR);
     }
-    std::string inv_path(save_directory + appid + folder);
+    std::string inv_path(get_app_save_directory() + folder);
     std::string full_path(inv_path + file);
 
     return load_json(full_path, json);
@@ -869,7 +877,7 @@ bool Local_Storage::write_json_file(std::string folder, std::string const&file, 
     if (!folder.empty() && folder.back() != *PATH_SEPARATOR) {
         folder.append(PATH_SEPARATOR);
     }
-    std::string inv_path(save_directory + appid + folder);
+    std::string inv_path(get_app_save_directory() + folder);
     std::string full_path(inv_path + file);
 
     create_directory(inv_path);
@@ -930,7 +938,7 @@ std::string Local_Storage::load_image_resized(std::string const& image_path, std
 
 bool Local_Storage::save_screenshot(std::string const& image_path, uint8_t* img_ptr, int32_t width, int32_t height, int32_t channels)
 {
-    std::string screenshot_path(save_directory + appid + screenshots_folder + PATH_SEPARATOR);
+    std::string screenshot_path(get_app_save_directory() + screenshots_folder + PATH_SEPARATOR);
     create_directory(screenshot_path);
     screenshot_path += image_path;
     return stbi_write_png(screenshot_path.c_str(), width, height, channels, img_ptr, 0) == 1;

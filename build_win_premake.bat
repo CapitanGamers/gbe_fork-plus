@@ -5,6 +5,7 @@ cd /d "%~dp0"
 set /a "BUILD_DEPS=0"
 set /a "GEN_PROJECT=1"
 set /a "BUILD_JOBS=-1"
+set "BUILD_ARM64=0"
 
 :args_loop
   if "%~1" equ "" (
@@ -13,6 +14,8 @@ set /a "BUILD_JOBS=-1"
     set /a "BUILD_DEPS=1"
   ) else if "%~1" equ "--nogen" (
     set /a "GEN_PROJECT=0"
+  ) else if "%~1" equ "--arm64" (
+    set "BUILD_ARM64=1"
   ) else if "%~1" equ "--j" (
     set /a "BUILD_JOBS=%~2"
     shift /1
@@ -49,10 +52,25 @@ set /a "BUILD_JOBS=-1"
   :: build deps
   if %BUILD_DEPS% equ 1 (
     set "CMAKE_GENERATOR=Visual Studio 18 2026"
-    call "%PREMAKE_EXE%" --file="premake5-deps.lua" --64-build --32-build --arm-build --all-ext --all-build --j=2 --verbose --clean --os=windows vs2026 || (
+    set "ARM_DEP="
+    if "%BUILD_ARM64%" equ "1" set "ARM_DEP=--arm-build"
+    call "%PREMAKE_EXE%" --file="premake5-deps.lua" --64-build --32-build !ARM_DEP! --all-ext --all-build --j=2 --verbose --clean --os=windows vs2026 || (
       goto :end_script_with_err
     )
     goto :end_script
+  )
+
+  :: Rebuild cached overlay libraries once when upgrading from an older build.
+  set "OVERLAY_BUILD="
+  set "OVERLAY_DIR=build\deps\win\vs2026\ingame_overlay"
+  if not exist "!OVERLAY_DIR!\install64\steamem-dx11-lifetime.txt" set "OVERLAY_BUILD=!OVERLAY_BUILD! --64-build"
+  if not exist "!OVERLAY_DIR!\install32\steamem-dx11-lifetime.txt" set "OVERLAY_BUILD=!OVERLAY_BUILD! --32-build"
+  if "%BUILD_ARM64%" equ "1" if not exist "!OVERLAY_DIR!\installarm\steamem-dx11-lifetime.txt" set "OVERLAY_BUILD=!OVERLAY_BUILD! --arm-build"
+  if defined OVERLAY_BUILD (
+    set "CMAKE_GENERATOR=Visual Studio 18 2026"
+    call "%PREMAKE_EXE%" --file="premake5-deps.lua" !OVERLAY_BUILD! --build-ingame_overlay --j=!MAX_THREADS! --os=windows vs2026 || (
+      goto :end_script_with_err
+    )
   )
 
   :: check vswhere
@@ -98,8 +116,9 @@ set /a "BUILD_JOBS=-1"
 
   :: build .sln
   set "BUILD_TYPES=release debug"
-  set "BUILD_PLATFORMS=x64 Win32 ARM64"
-  set "BUILD_TARGETS=api_regular api_experimental steamclient_experimental_stub steamclient_experimental steamclient_experimental_loader steamclient_experimental_extra lib_game_overlay_renderer tool_lobby_connect tool_generate_interfaces"
+  set "BUILD_PLATFORMS=x64 Win32"
+  if "%BUILD_ARM64%" equ "1" set "BUILD_PLATFORMS=x64 Win32 ARM64"
+  set "BUILD_TARGETS=api_regular api_experimental steamem_launcher epic_lan_launcher steamclient_experimental_stub steamclient_experimental steamclient_experimental_loader steamclient_experimental_extra lib_game_overlay_renderer tool_lobby_connect tool_generate_interfaces"
 
   for %%A in (%BUILD_TYPES%) do (
     set "BUILD_TYPE=%%A"
@@ -131,6 +150,7 @@ set /a "BUILD_JOBS=-1"
   echo:switches:
   echo:  --deps: rebuild third-party dependencies
   echo:  --nogen: don't regenerate build files
+  echo:  --arm64: also build for ARM64 with the ARM64 compiler and dependencies
   echo:  --j: parallel build jobs
   echo:  --help: show this page
   goto :end_script

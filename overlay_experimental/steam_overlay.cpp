@@ -45,6 +45,8 @@
 // builtin audio
 #include "overlay/notification.h"
 
+#include "overlay/persian_shaper.hpp"
+
 #define URL_WINDOW_NAME "URL Window"
 
 static constexpr int max_window_id = 10000;
@@ -52,7 +54,8 @@ static constexpr int base_notif_window_id  = 0 * max_window_id;
 static constexpr int base_friend_window_id = 1 * max_window_id;
 static constexpr int base_friend_item_id   = 2 * max_window_id;
 
-// look for the column 'API language code' here: https://partner.steamgames.com/doc/store/localization/languages
+static constexpr int PERSIAN_LANG_INDEX = 31;
+
 static constexpr const char* valid_languages[] = {
     "english",
     "arabic",
@@ -85,7 +88,113 @@ static constexpr const char* valid_languages[] = {
     "vietnamese",
     "croatian",
     "indonesian",
+    "persian",
 };
+
+// تبدیل ایمن متون فارسی به فرم چسبیده و راست‌به‌چپ (بدون دوباره‌کاری روی رشته شکل‌یافته)
+static inline std::string fa_shape(const std::string& s) {
+    auto cps = PersianShaper::utf8_to_codepoints(s);
+    for (uint32_t cp : cps) {
+        if (cp >= 0x0600 && cp <= 0x06FF) {
+            return PersianShaper::shape_for_overlay(s);
+        }
+    }
+    return s;
+}
+
+static const char* overlay_label(int language, const char* english, const char* persian)
+{
+    if (language != PERSIAN_LANG_INDEX) return english;
+
+    static thread_local std::unordered_map<const char*, std::string> shaped_labels;
+    auto it = shaped_labels.find(persian);
+    if (it == shaped_labels.end()) {
+        it = shaped_labels.emplace(persian, fa_shape(persian)).first;
+    }
+    return it->second.c_str();
+}
+
+template <typename T>
+static inline const char* tr_ui(int lang, const T& table, const char* fa_raw)
+{
+    const int safe_idx = (lang >= 0 && lang < PERSIAN_LANG_INDEX) ? lang : 0;
+    return overlay_label(lang, table[safe_idx], fa_raw);
+}
+
+static void align_overlay_item_right(float width)
+{
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - width));
+}
+
+static void overlay_line(const char* visual_text, bool rtl)
+{
+    if (rtl) align_overlay_item_right(ImGui::CalcTextSize(visual_text).x);
+    ImGui::TextUnformatted(visual_text);
+}
+
+static void overlay_paragraph(const char* text, bool rtl)
+{
+    if (!rtl) {
+        ImGui::TextWrapped("%s", text);
+        return;
+    }
+
+    const float width = ImGui::GetContentRegionAvail().x;
+    std::istringstream paragraphs(text);
+    for (std::string paragraph; std::getline(paragraphs, paragraph);) {
+        std::istringstream words(paragraph);
+        std::string line;
+        for (std::string word; words >> word;) {
+            std::string candidate = line.empty() ? word : line + ' ' + word;
+            if (!line.empty() && ImGui::CalcTextSize(fa_shape(candidate).c_str()).x > width) {
+                overlay_line(fa_shape(line).c_str(), true);
+                line = std::move(word);
+            } else {
+                line = std::move(candidate);
+            }
+        }
+        overlay_line(fa_shape(line).c_str(), true);
+    }
+}
+
+static bool overlay_button(const char* label, bool rtl)
+{
+    if (rtl) align_overlay_item_right(ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f);
+    return ImGui::Button(label);
+}
+
+static bool overlay_checkbox(const char* label, bool* value, bool rtl)
+{
+    if (!rtl) return ImGui::Checkbox(label, value);
+
+    align_overlay_item_right(ImGui::CalcTextSize(label).x + ImGui::GetFrameHeight()
+        + ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    const bool label_clicked = ImGui::IsItemClicked();
+    ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::PushID(label);
+    const bool changed = ImGui::Checkbox("##toggle", value);
+    ImGui::PopID();
+    if (label_clicked) *value = !*value;
+    return changed || label_clicked;
+}
+
+static std::string normalize_ip_field(const char* text)
+{
+    auto codepoints = PersianShaper::utf8_to_codepoints(text);
+    for (auto &cp : codepoints) {
+        if (cp >= 0x06F0 && cp <= 0x06F9) cp = '0' + cp - 0x06F0;
+        if (cp >= 0x0660 && cp <= 0x0669) cp = '0' + cp - 0x0660;
+    }
+    return PersianShaper::codepoints_to_utf8(codepoints);
+}
+
+static bool overlay_peer_visible(const PeerDiscoverySnapshot& discovery, uint64 friend_id)
+{
+    return discovery.automatic_discovery
+        || std::find(discovery.manual_users.begin(), discovery.manual_users.end(), CSteamID(friend_id)) != discovery.manual_users.end();
+}
 
 
 // ListBoxHeader() is deprecated and inlined inside <imgui.h>
@@ -242,6 +351,8 @@ Steam_Overlay::Steam_Overlay(Settings* settings, Local_Storage *local_storage, S
     parse_key_combo();
     parse_screenshot_key_combo();
     strncpy(username_text, settings->get_local_name(), sizeof(username_text));
+    displayed_local_name = settings->get_local_name();
+    displayed_app_id = settings->get_local_game_id().AppID();
 
     // we need these copies to show the warning only once, then disable the flag
     // avoid manipulating settings->xxx
@@ -281,71 +392,108 @@ Steam_Overlay::~Steam_Overlay()
     this->run_every_runcb->remove(&Steam_Overlay::overlay_run_callback, this);
 }
 
+void Steam_Overlay::log_overlay_startup(const char *message) const
+{
+    try {
+        const auto folder = std::filesystem::u8path(local_storage->get_path(""));
+        if (folder.empty()) return;
+
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        if (error) return;
+
+        std::ofstream log(folder / "overlay-startup.log", std::ios::app);
+        log << '[' << common_helpers::get_utc_time() << " UTC] " << message << '\n';
+    } catch (const std::exception &) {
+        PRINT_DEBUG("could not write the overlay startup log");
+    }
+}
+
 void Steam_Overlay::request_renderer_detector()
 {
     PRINT_DEBUG_ENTRY();
-    // request renderer detection
+    renderer_detector_active = true;
     InGameOverlay::DetectRenderer();
 }
 
 void Steam_Overlay::cleanup_renderer_hook()
 {
+    if (!renderer_detector_active) return;
     InGameOverlay::StopRendererDetection();
     InGameOverlay::FreeDetector();
+    renderer_detector_active = false;
 }
 
 bool Steam_Overlay::renderer_hook_proc()
 {
-    auto expiration_time = std::chrono::steady_clock::now() + std::chrono::seconds(settings->overlay_renderer_detector_timeout_sec);
+    InGameOverlay::RendererHook_t *detected = nullptr;
+    const auto timeout = std::chrono::seconds(settings->overlay_renderer_detector_timeout_sec);
+    for (int attempt = 1; attempt <= 2 && setup_overlay_called; ++attempt) {
+        if (attempt == 2) request_renderer_detector();
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (setup_overlay_called) {
+            if (!InGameOverlay::DetectRenderer()) {
+                detected = InGameOverlay::GetDetectedRenderer();
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        cleanup_renderer_hook();
+        if (detected || !setup_overlay_called) break;
+        PRINT_DEBUG("renderer detection timed out (attempt %i of 2)", attempt);
+    }
+    if (!detected) {
+        if (setup_overlay_called) log_overlay_startup("Renderer detection did not find a renderer after two attempts.");
+        return true;
+    }
 
-    while (std::chrono::steady_clock::now() < expiration_time && InGameOverlay::DetectRenderer()) {
+    {
+        std::lock_guard lock(overlay_mutex);
+        _renderer = detected;
+    }
+
+    // Steam shutdown can hold global_mutex while waiting for this worker.
+    while (setup_overlay_called) {
+        std::unique_lock client_lock(global_mutex, std::try_to_lock);
+        if (client_lock.owns_lock()) {
+            std::lock_guard lock(overlay_mutex);
+            if (!setup_overlay_called) return true;
+            load_achievements_data();
+            get_steam_client()->steam_screenshots->overlay_take_screenshot = [this]() {
+                std::lock_guard lock(overlay_mutex);
+                if (Ready()) _renderer->TakeScreenshot(InGameOverlay::ScreenshotType_t::BeforeOverlay);
+            };
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    if (!setup_overlay_called) return true;
 
-    // exit on failure
-    bool final_chance = InGameOverlay::DetectRenderer();
-    // again check for 'setup_overlay_called' to be extra sure that the overlay wasn't deinitialized
-    if (!setup_overlay_called || final_chance) {
-        PRINT_DEBUG("failed to detect renderer, overlay was set up=%i",
-            (int)setup_overlay_called
-        );
-        cleanup_renderer_hook();
-        return true;
-    }
-
-    // do a one time initialization
-    // std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
-    _renderer = InGameOverlay::GetDetectedRenderer();
-    cleanup_renderer_hook();
-    if (!_renderer) { // is this even possible?
-        PRINT_DEBUG("renderer hook was null!");
-        return true;
-    }
     PRINT_DEBUG("got renderer hook %p for '%s'", _renderer, _renderer->GetLibraryName());
 
-    // note: make sure to load all relevant strings before creating the font(s), otherwise some glyphs ranges will be missing
-    load_achievements_data();
+    // Load strings before building the font atlas so that all required glyphs are present.
     load_audio();
     create_fonts();
+    if (!setup_overlay_called) return true;
 
-    // setup renderer callbacks
-    auto overlay_toggle_callback = [this]() { open_overlay_hook(true); };
+    auto overlay_toggle_callback = [this]() { toggle_overlay_request(); };
     _renderer->OverlayProc = [this]() { overlay_render_proc(); };
     _renderer->OverlayHookReady = [this](InGameOverlay::OverlayHookState state) {
         PRINT_DEBUG("hook state changed to <%i>", (int)state);
         overlay_state_hook(state == InGameOverlay::OverlayHookState::Ready || state == InGameOverlay::OverlayHookState::Reset);
     };
 
-    bool started = _renderer->StartHook(overlay_toggle_callback, toggle_keys.data(), (int)toggle_keys.size(), &fonts_atlas);
-    PRINT_DEBUG("started renderer hook (result=%i)", (int)started);
-
-    // Register screenshot callback
+    if (!_renderer->StartHook(overlay_toggle_callback, toggle_keys.data(), (int)toggle_keys.size(), &fonts_atlas)) {
+        is_ready = false;
+        log_overlay_startup("Renderer detected, but the overlay renderer hook failed to start.");
+        PRINT_DEBUG("failed to start renderer hook");
+        return true;
+    }
+    PRINT_DEBUG("started renderer hook");
     _renderer->SetScreenshotCallback(&Steam_Overlay::on_screenshot_captured, this);
-
-    // Wire up TriggerScreenshot API to use the overlay renderer
-    get_steam_client()->steam_screenshots->overlay_take_screenshot = [this]() {
-        if (_renderer) _renderer->TakeScreenshot(InGameOverlay::ScreenshotType_t::BeforeOverlay);
-    };
+    log_overlay_startup("Renderer hook installed.");
+    renderer_hook_installed = true;
 
     return true;
 }
@@ -468,14 +616,33 @@ void Steam_Overlay::create_fonts()
     }
     font_builder.AddRanges(fonts_atlas.GetGlyphRangesDefault());
 
-    font_builder.BuildRanges(&ranges);
-    font_cfg.GlyphRanges = ranges.Data;
+    static const ImWchar persian_glyph_ranges[] = {
+        0x0600, 0x06FF, // حروف پایه فارسی و عربی
+        0x200C, 0x200F, // نیم‌فاصله
+        0xFB50, 0xFDFF, // فرم‌های چسبیده فارسی (پ، چ، ژ، گ، ک، ی)
+        0xFE70, 0xFEFF, // فرم‌های چسبیده استاندارد (اول، وسط، آخر)
+        0
+    };
+    font_builder.AddRanges(persian_glyph_ranges);
 
-    auto add_overlay_font = [this](float size, const std::string &custom_font = "") {
+    font_builder.BuildRanges(&ranges);
+    std::string default_font = settings->overlay_appearance.font_override;
+#ifdef __WINDOWS__
+    if (default_font.empty()) {
+        wchar_t windows_dir[MAX_PATH]{};
+        const UINT length = GetWindowsDirectoryW(windows_dir, static_cast<UINT>(std::size(windows_dir)));
+        if (length > 0 && length < std::size(windows_dir)) {
+            const auto system_font = std::filesystem::path(windows_dir) / "Fonts" / "segoeui.ttf";
+            std::error_code error;
+            if (std::filesystem::is_regular_file(system_font, error)) default_font = system_font.u8string();
+        }
+    }
+#endif
+    auto add_overlay_font = [this, &default_font](float size, const std::string &custom_font = "") {
         font_cfg.SizePixels = size;
         font_cfg.MergeMode = false;
 
-        const std::string &font_path = custom_font.empty() ? settings->overlay_appearance.font_override : custom_font;
+        const std::string &font_path = custom_font.empty() ? default_font : custom_font;
         ImFont *font = nullptr;
         if (font_path.size()) {
             font = fonts_atlas.AddFontFromFileTTF(font_path.c_str(), size, &font_cfg);
@@ -581,42 +748,19 @@ void Steam_Overlay::load_achievements_data()
 void Steam_Overlay::overlay_state_hook(bool ready)
 {
     PRINT_DEBUG("%i", (int)ready);
-
-    // NOTE usage of local objects here cause an exception when this is called with false state
-    // the reason is that by the time this hook is called, the object may have been already destructed
-    // this is why we use global mutex
-    // TODO this also doesn't seem right, no idea why it happens though
-    // NOTE after initializing the renderer detector on another thread this was solved
-    std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
     if (!setup_overlay_called) return;
 
+    if (!ready) late_init_imgui = false;
+    if (ready && ImGui::GetCurrentContext()) ImGui::GetIO().IniFilename = nullptr;
     is_ready = ready;
-
-    if (ready) {
-        // Antichamber may crash here because ImGui Context is null!, no idea why
-        bool not_yet = false;
-        if (ImGui::GetCurrentContext() && late_init_imgui.compare_exchange_weak(not_yet, true)) {
-            PRINT_DEBUG("late init ImGui");
-
-            ImGuiIO &io = ImGui::GetIO();
-            // disable loading the default ini file
-            io.IniFilename = NULL;
-
-            ImGuiStyle &style = ImGui::GetStyle();
-            // Disable round window
-            style.WindowRounding = 0.0;
-        }
-    }
 }
 
 // called when the user presses SHIFT + TAB
-bool Steam_Overlay::open_overlay_hook(bool toggle)
+void Steam_Overlay::toggle_overlay_request()
 {
-    if (toggle) {
-        ShowOverlay(!show_overlay);
-    }
-
-    return show_overlay;
+    if (!setup_overlay_called) return;
+    bool requested = overlay_requested.load();
+    while (!overlay_requested.compare_exchange_weak(requested, !requested)) {}
 }
 
 void Steam_Overlay::allow_renderer_frame_processing(bool state, bool cleaning_up_overlay)
@@ -646,15 +790,12 @@ void Steam_Overlay::obscure_game_input(bool state) {
     if (state) {
         auto new_val = ++obscure_cursor_requests;
         if (new_val == 1) { // only take an action on first request
-            ImGuiIO &io = ImGui::GetIO();
-            // force draw the cursor, otherwise games like Truberbrook will not have an overlay cursor
-            io.MouseDrawCursor = state;
-            // not necessary, just to be sure
-            io.WantCaptureMouse = state;
-            // not necessary, just to be sure
-            io.WantCaptureKeyboard = state;
-
-            // clip the cursor
+            if (ImGui::GetCurrentContext()) {
+                ImGuiIO &io = ImGui::GetIO();
+                io.MouseDrawCursor = true;
+                io.WantCaptureMouse = true;
+                io.WantCaptureKeyboard = true;
+            }
             _renderer->HideAppInputs(true);
             PRINT_DEBUG("obscured app input (count=%u)", new_val);
         }
@@ -662,15 +803,12 @@ void Steam_Overlay::obscure_game_input(bool state) {
         if (obscure_cursor_requests > 0) {
             auto new_val = --obscure_cursor_requests;
             if (!new_val) { // only take an action when the requests reach 0
-                ImGuiIO &io = ImGui::GetIO();
-                // force draw the cursor, otherwise games like Truberbrook will not have an overlay cursor
-                io.MouseDrawCursor = state;
-                // not necessary, just to be sure
-                io.WantCaptureMouse = state;
-                // not necessary, just to be sure
-                io.WantCaptureKeyboard = state;
-
-                // restore the old cursor
+                if (ImGui::GetCurrentContext()) {
+                    ImGuiIO &io = ImGui::GetIO();
+                    io.MouseDrawCursor = false;
+                    io.WantCaptureMouse = false;
+                    io.WantCaptureKeyboard = false;
+                }
                 _renderer->HideAppInputs(false);
                 PRINT_DEBUG("restored app input (count=%u)", new_val);
             }
@@ -825,7 +963,7 @@ void Steam_Overlay::show_test_achievement()
 {
     PRINT_DEBUG_ENTRY();
     Overlay_Achievement ach{};
-    ach.title = translationTestAchievement[current_language];
+    ach.title = tr_ui(current_language, translationTestAchievement, "تست دستاورد");
     ach.description = "~~~ " + ach.title + " ~~~";
     ach.achieved = true;
 
@@ -864,20 +1002,20 @@ void Steam_Overlay::build_friend_context_menu(Friend const& frd, friend_window_s
         bool close_popup = false;
 
         // user clicked on "chat"
-        if (ImGui::Button(translationChat[current_language])) {
+        if (ImGui::Button(tr_ui(current_language, translationChat, "گفت‌وگو"))) {
             close_popup = true;
             state.window_state |= window_state_show;
         }
         // user clicked on "copy id" on a friend
-        if (ImGui::Button(translationCopyId[current_language])) {
+        if (ImGui::Button(tr_ui(current_language, translationCopyId, "کپی آیدی استیم"))) {
             close_popup = true;
             auto friend_id_str = std::to_string(frd.id());
             ImGui::SetClipboardText(friend_id_str.c_str());
         }
         // If we have the same appid, activate the invite/join buttons
-        if (settings->get_local_game_id().AppID() == frd.appid()) {
+        if (displayed_app_id == frd.appid()) {
             // user clicked on "invite to game"
-            std::string translationInvite_tmp(translationInvite[current_language]);
+            std::string translationInvite_tmp(tr_ui(current_language, translationInvite, "دعوت"));
             translationInvite_tmp.append("##PopupInviteToGame");
             if (i_have_lobby && ImGui::Button(translationInvite_tmp.c_str())) {
                 close_popup = true;
@@ -886,7 +1024,7 @@ void Steam_Overlay::build_friend_context_menu(Friend const& frd, friend_window_s
             }
 
             // user clicked on "accept game invite"
-            std::string translationJoin_tmp(translationJoin[current_language]);
+            std::string translationJoin_tmp(tr_ui(current_language, translationJoin, "پیوستن"));
             translationJoin_tmp.append("##PopupAcceptInvite");
             if (state.joinable && ImGui::Button(translationJoin_tmp.c_str())) {
                 close_popup = true;
@@ -917,9 +1055,6 @@ void Steam_Overlay::build_friend_window(Friend const& frd, friend_window_state& 
 
     float width = ImGui::CalcTextSize("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").x;
 
-    if (state.window_state & window_state_need_attention && ImGui::IsWindowFocused()) {
-        state.window_state &= ~window_state_need_attention;
-    }
     ImGui::SetNextWindowSizeConstraints(ImVec2{ width, ImGui::GetFontSize()*8 + ImGui::GetFrameHeightWithSpacing()*4 },
         ImVec2{ std::numeric_limits<float>::max() , std::numeric_limits<float>::max() });
 
@@ -946,34 +1081,16 @@ void Steam_Overlay::build_friend_window(Friend const& frd, friend_window_state& 
             }
         }
 
-        ImGui::InputTextMultiline("##chat_history", &state.chat_history[0], state.chat_history.length(), { -1.0f, -2.0f * ImGui::GetFontSize() }, ImGuiInputTextFlags_ReadOnly);
-        // TODO: Fix the layout of the chat line + send button.
-        // It should be like this: chat input should fill the window size minus send button size (button size is fixed)
-        // |------------------------------|
-        // | /--------------------------\ |
-        // | |                          | |
-        // | |       chat history       | |
-        // | |                          | |
-        // | \--------------------------/ |
-        // | [____chat line______] [send] |
-        // |------------------------------|
-        //
-        // And it is like this
-        // |------------------------------|
-        // | /--------------------------\ |
-        // | |                          | |
-        // | |       chat history       | |
-        // | |                          | |
-        // | \--------------------------/ |
-        // | [__chat line__] [send]       |
-        // |------------------------------|
-        float wnd_width = ImGui::GetContentRegionAvail().x;
-        ImGuiStyle &style = ImGui::GetStyle();
-        wnd_width -= ImGui::CalcTextSize(translationSend[current_language]).x + style.FramePadding.x * 2 + style.ItemSpacing.x + 1;
+        ImGui::InputTextMultiline("##chat_history", state.chat_history.data(), state.chat_history.size() + 1,
+            { -1.0f, -ImGui::GetFrameHeightWithSpacing() }, ImGuiInputTextFlags_ReadOnly);
+        const char* send_label = tr_ui(current_language, translationSend, "ارسال");
+        const auto &style = ImGui::GetStyle();
+        const float send_width = ImGui::CalcTextSize(send_label).x + style.FramePadding.x * 2;
+        const float input_width = std::max(1.0f, ImGui::GetContentRegionAvail().x - send_width - style.ItemSpacing.x);
 
         uint64_t frd_id = frd.id();
         ImGui::PushID((const char *)&frd_id, (const char *)&frd_id + sizeof(frd_id));
-        ImGui::PushItemWidth(wnd_width);
+        ImGui::PushItemWidth(input_width);
 
         if (ImGui::InputText("##chat_line", state.chat_input, max_chat_len, ImGuiInputTextFlags_EnterReturnsTrue)) {
             send_chat_msg = true;
@@ -985,7 +1102,7 @@ void Steam_Overlay::build_friend_window(Friend const& frd, friend_window_state& 
 
         ImGui::SameLine();
 
-        if (ImGui::Button(translationSend[current_language])) {
+        if (ImGui::Button(send_label)) {
             send_chat_msg = true;
         }
 
@@ -1660,6 +1777,11 @@ bool Steam_Overlay::try_load_ach_icon(Overlay_Achievement &ach, bool achieved, b
     // icons needs to be loaded, but we're not allowed
     if (!upload_new_icon_to_gpu) return false;
 
+    // Steam callbacks can already hold global_mutex while waiting for overlay state.
+    // Loading an icon is optional for this frame, so never wait for that lock here.
+    std::unique_lock client_lock(global_mutex, std::try_to_lock);
+    if (!client_lock) return false;
+
     int &icon_handle = achieved ? ach.icon_handle : ach.icon_gray_handle;
     if (Settings::UNLOADED_IMAGE_HANDLE == icon_handle) { // not loaded yet
         icon_handle = get_steam_client()->steam_user_stats->get_achievement_icon_handle(ach.name, achieved);
@@ -1679,9 +1801,29 @@ bool Steam_Overlay::try_load_ach_icon(Overlay_Achievement &ach, bool achieved, b
 // Try to make this function as short as possible or it might affect game's fps.
 void Steam_Overlay::overlay_render_proc()
 {
-    std::lock_guard lock(overlay_mutex);
+    if (!setup_overlay_called || !renderer_hook_installed || !ImGui::GetCurrentContext()) return;
 
-    if (!Ready()) return;
+    // Keep drawing while the game is running Steam callbacks. The UI reads a cached
+    // profile and uses its own synchronization for changes that reach the game.
+    std::unique_lock lock(overlay_mutex, std::try_to_lock);
+    if (!lock.owns_lock() || !setup_overlay_called) return;
+
+    if (!late_init_imgui.exchange(true)) {
+        ImGuiIO &io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.MouseDrawCursor = show_overlay;
+        _renderer->HideOverlayInputs(renderer_frame_processing_requests == 0);
+        _renderer->HideAppInputs(obscure_cursor_requests > 0);
+    }
+    is_ready = true;
+
+    const bool requested = overlay_requested;
+    if (show_overlay != requested) {
+        show_overlay = requested;
+        overlay_state_changed = true;
+        allow_renderer_frame_processing(requested);
+        obscure_game_input(requested);
+    }
 
     // Process achievement queue to show scheduled notifications
     process_achievement_queue();
@@ -1823,9 +1965,9 @@ void Steam_Overlay::overlay_render_proc()
         ImGuiIO &io = ImGui::GetIO();
         build_notifications(io.DisplaySize.x, io.DisplaySize.y);
     }
-
     if (stats.show_any_stats()) {
-        stats.render_stats(current_language);
+        int stats_lang = (current_language < TRANSLATION_NUMBER_OF_LANGUAGES) ? current_language : 0;
+        stats.render_stats(stats_lang);
     }
 
     load_next_ach_icon();
@@ -1833,450 +1975,654 @@ void Steam_Overlay::overlay_render_proc()
 
 uint32 Steam_Overlay::apply_global_style_color()
 {
-    uint32 style_color_stack = 0;
-    if ((settings->overlay_appearance.background_r >= 0) &&
-        (settings->overlay_appearance.background_g >= 0) &&
-        (settings->overlay_appearance.background_b >= 0) &&
-        (settings->overlay_appearance.background_a >= 0)) {
-        ImVec4 colorSet = ImVec4(
-            settings->overlay_appearance.background_r,
-            settings->overlay_appearance.background_g,
-            settings->overlay_appearance.background_b,
-            settings->overlay_appearance.background_a
-        );
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, colorSet);
-        style_color_stack += 1;
-    }
+    ImVec4 bg_col = (settings->overlay_appearance.background_r >= 0 &&
+                     settings->overlay_appearance.background_g >= 0 &&
+                     settings->overlay_appearance.background_b >= 0 &&
+                     settings->overlay_appearance.background_a >= 0)
+        ? ImVec4(settings->overlay_appearance.background_r,
+                 settings->overlay_appearance.background_g,
+                 settings->overlay_appearance.background_b,
+                 settings->overlay_appearance.background_a)
+        : ImVec4(0.058f, 0.082f, 0.129f, 0.99f);
 
-    if ((settings->overlay_appearance.element_r >= 0) &&
-        (settings->overlay_appearance.element_g >= 0) &&
-        (settings->overlay_appearance.element_b >= 0) &&
-        (settings->overlay_appearance.element_a >= 0)) {
-        ImVec4 colorSet = ImVec4(
-            settings->overlay_appearance.element_r,
-            settings->overlay_appearance.element_g,
-            settings->overlay_appearance.element_b,
-            settings->overlay_appearance.element_a
-        );
-        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_Button, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_ResizeGrip, colorSet);
-        style_color_stack += 4;
-    }
+    ImVec4 elem_col = (settings->overlay_appearance.element_r >= 0 &&
+                       settings->overlay_appearance.element_g >= 0 &&
+                       settings->overlay_appearance.element_b >= 0 &&
+                       settings->overlay_appearance.element_a >= 0)
+        ? ImVec4(settings->overlay_appearance.element_r,
+                 settings->overlay_appearance.element_g,
+                 settings->overlay_appearance.element_b,
+                 settings->overlay_appearance.element_a)
+        : ImVec4(0.15f, 0.22f, 0.32f, 1.0f);
 
-    if ((settings->overlay_appearance.element_hovered_r >= 0) &&
-        (settings->overlay_appearance.element_hovered_g >= 0) &&
-        (settings->overlay_appearance.element_hovered_b >= 0) &&
-        (settings->overlay_appearance.element_hovered_a >= 0)) {
-        ImVec4 colorSet = ImVec4(
-            settings->overlay_appearance.element_hovered_r,
-            settings->overlay_appearance.element_hovered_g,
-            settings->overlay_appearance.element_hovered_b,
-            settings->overlay_appearance.element_hovered_a
-        );
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, colorSet);
-        style_color_stack += 4;
-    }
+    ImVec4 hover_col = (settings->overlay_appearance.element_hovered_r >= 0 &&
+                        settings->overlay_appearance.element_hovered_g >= 0 &&
+                        settings->overlay_appearance.element_hovered_b >= 0 &&
+                        settings->overlay_appearance.element_hovered_a >= 0)
+        ? ImVec4(settings->overlay_appearance.element_hovered_r,
+                 settings->overlay_appearance.element_hovered_g,
+                 settings->overlay_appearance.element_hovered_b,
+                 settings->overlay_appearance.element_hovered_a)
+        : ImVec4(0.19f, 0.36f, 0.51f, 1.0f);
 
-    if ((settings->overlay_appearance.element_active_r >= 0) &&
-        (settings->overlay_appearance.element_active_g >= 0) &&
-        (settings->overlay_appearance.element_active_b >= 0) &&
-        (settings->overlay_appearance.element_active_a >= 0)) {
-        ImVec4 colorSet = ImVec4(
-            settings->overlay_appearance.element_active_r,
-            settings->overlay_appearance.element_active_g,
-            settings->overlay_appearance.element_active_b,
-            settings->overlay_appearance.element_active_a
-        );
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_Header, colorSet);
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, colorSet);
-        style_color_stack += 5;
-    }
+    ImVec4 active_col = (settings->overlay_appearance.element_active_r >= 0 &&
+                         settings->overlay_appearance.element_active_g >= 0 &&
+                         settings->overlay_appearance.element_active_b >= 0 &&
+                         settings->overlay_appearance.element_active_a >= 0)
+        ? ImVec4(settings->overlay_appearance.element_active_r,
+                 settings->overlay_appearance.element_active_g,
+                 settings->overlay_appearance.element_active_b,
+                 settings->overlay_appearance.element_active_a)
+        : ImVec4(0.16f, 0.35f, 0.48f, 1.0f);
 
-    return style_color_stack;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, bg_col);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.088f, 0.122f, 0.179f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.27f, 0.36f, 0.50f, 0.63f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.06f, 0.08f, 0.12f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, elem_col);
+    ImGui::PushStyleColor(ImGuiCol_Button, elem_col);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.12f, 0.15f, 0.22f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_ResizeGrip, elem_col);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hover_col);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, hover_col);
+    ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, hover_col);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, hover_col);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, active_col);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, active_col);
+    ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, active_col);
+    ImGui::PushStyleColor(ImGuiCol_Header, active_col);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, active_col);
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, ImVec4(0.15f, 0.21f, 0.30f, 0.70f));
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, ImVec4(0.17f, 0.24f, 0.35f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.38f, 0.51f, 0.65f, 0.28f));
+
+    return 20;
 }
 
-// Try to make this function as short as possible or it might affect game's fps.
+void Steam_Overlay::render_overlay_controls()
+{
+    const bool rtl = current_language == PERSIAN_LANG_INDEX;
+    if (settings->overlay_show_button_user_info) {
+        overlay_checkbox(tr_ui(current_language, translationToggleUserInfo, "اطلاعات بازیکن"), &show_user_info, rtl);
+    }
+    if (settings->overlay_show_checkbox_fps) {
+        if (overlay_checkbox(tr_ui(current_language, translationFpsCheckbox, "نمایش FPS"), &stats.show_fps, rtl)) {
+            allow_renderer_frame_processing(stats.show_fps);
+        }
+    }
+    if (settings->overlay_show_checkbox_frametime) {
+        if (overlay_checkbox(tr_ui(current_language, translationFrametimeCheckbox, "زمان فریم"), &stats.show_frametime, rtl)) {
+            allow_renderer_frame_processing(stats.show_frametime);
+        }
+    }
+    if (settings->overlay_show_checkbox_playtime) {
+        if (overlay_checkbox(tr_ui(current_language, translationPlaytimeCheckbox, "تایمر بازی"), &stats.show_playtime, rtl)) {
+            allow_renderer_frame_processing(stats.show_playtime);
+        }
+    }
+    if (settings->overlay_show_button_copy_id) {
+        if (overlay_button(tr_ui(current_language, translationCopyId, "کپی آیدی استیم"), rtl)) {
+            const auto id = std::to_string(settings->get_local_steam_id().ConvertToUint64());
+            ImGui::SetClipboardText(id.c_str());
+        }
+    }
+    if (settings->overlay_show_button_test_achievement) {
+        if (overlay_button(tr_ui(current_language, translationTestAchievement, "تست دستاورد"), rtl)) {
+            show_test_achievement();
+        }
+    }
+}
+
+void Steam_Overlay::render_friends_page(const PeerDiscoverySnapshot& discovery)
+{
+    const bool rtl = current_language == PERSIAN_LANG_INDEX;
+    auto label = [this](const char* english, const char* persian) {
+        return overlay_label(current_language, english, persian);
+    };
+    const auto visible = [&discovery](const auto& entry) {
+        return overlay_peer_visible(discovery, entry.first.id());
+    };
+    const auto visible_count = std::count_if(friends.begin(), friends.end(), visible);
+    const auto count = std::to_string(visible_count);
+    const std::string title = tr_ui(current_language, translationFriends, "دوستان");
+    const auto heading = rtl ? "(" + count + ") " + title : title + " (" + count + ")";
+    overlay_line(heading.c_str(), rtl);
+    if (i_have_lobby && visible_count > 0
+        && overlay_button(tr_ui(current_language, translationInviteAll, "دعوت همه به لابی"), rtl)) {
+        invite_all_friends_clicked = true;
+    }
+    ImGui::Separator();
+
+    if (visible_count == 0) {
+        overlay_paragraph(rtl
+            ? "هنوز دوستی پیدا نشده است. برای جست‌وجو در شبکه، آدرس دوستتان را اضافه کنید."
+            : "No friends have been discovered. Add a friend's address to search over LAN or VPN.", rtl);
+        if (overlay_button(label("Add a friend's IP", "افزودن آدرس دوست"), rtl)) {
+            active_page = OverlayPage::Network;
+        }
+    }
+
+    const auto app_id = displayed_app_id;
+    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(rtl ? 1.0f : 0.0f, 0.5f));
+    for (auto &[friend_info, state] : friends) {
+        if (!overlay_peer_visible(discovery, friend_info.id())) continue;
+
+        ImGui::PushID(state.id);
+        const auto display_name = fa_shape(friend_info.name());
+        const auto row_label = display_name + "###friend_name";
+        ImGui::Selectable(row_label.c_str(), (state.window_state & window_state_show) != 0,
+            ImGuiSelectableFlags_AllowDoubleClick);
+        const bool open_chat = ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        build_friend_context_menu(friend_info, state);
+        if (open_chat) state.window_state |= window_state_show;
+
+        if (!rtl) ImGui::Indent();
+        const bool same_game = friend_info.appid() == app_id;
+        const bool can_join = same_game && state.joinable;
+        const std::string status = can_join ? label("Ready to join", "آماده پیوستن")
+            : same_game ? label("Playing this game", "در حال اجرای همین بازی")
+            : "AppID " + std::to_string(friend_info.appid());
+        ImGui::PushStyleColor(ImGuiCol_Text, can_join ? ImVec4(0.36f, 0.82f, 0.69f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        overlay_line(status.c_str(), rtl);
+        ImGui::PopStyleColor();
+
+        const char* chat = tr_ui(current_language, translationChat, "گفت‌وگو");
+        const bool has_game_action = same_game && (i_have_lobby || can_join);
+        const char* action = can_join
+            ? tr_ui(current_language, translationJoin, "پیوستن")
+            : tr_ui(current_language, translationInvite, "دعوت");
+        auto render_game_action = [&] {
+            if (ImGui::SmallButton(action)) {
+                state.window_state |= can_join ? window_state_join : window_state_invite;
+                has_friend_action.push(friend_info);
+            }
+        };
+        if (rtl) {
+            float width = ImGui::CalcTextSize(chat).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            if (has_game_action) {
+                width += ImGui::CalcTextSize(action).x + ImGui::GetStyle().FramePadding.x * 2.0f
+                    + ImGui::GetStyle().ItemSpacing.x;
+            }
+            align_overlay_item_right(width);
+            if (has_game_action) {
+                render_game_action();
+                ImGui::SameLine();
+            }
+        }
+        if (ImGui::SmallButton(chat)) state.window_state |= window_state_show;
+        if (!rtl && has_game_action) {
+            ImGui::SameLine();
+            render_game_action();
+        }
+        if (!rtl) ImGui::Unindent();
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::PopStyleVar();
+
+    if (!settings->overlay_show_button_settings
+        && ImGui::CollapsingHeader(label("Display and shortcuts", "نمایش و میانبرها"))) {
+        render_overlay_controls();
+    }
+}
+
+void Steam_Overlay::render_network_page(const PeerDiscoverySnapshot& discovery)
+{
+    const bool rtl = current_language == PERSIAN_LANG_INDEX;
+    auto label = [this](const char* english, const char* persian) {
+        return overlay_label(current_language, english, persian);
+    };
+    const ImVec4 accent(0.42f, 0.77f, 0.93f, 1.0f);
+    const ImVec4 warning(0.98f, 0.73f, 0.39f, 1.0f);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, accent);
+    overlay_line(label("Find a friend by IP", "پیدا کردن دوست با آدرس"), rtl);
+    ImGui::PopStyleColor();
+    overlay_paragraph(rtl
+        ? "نشانی دوستتان در شبکه داخلی را وارد کنید. اگر پورت را خالی بگذارید، از 47584 استفاده می‌شود."
+        : "Enter your friend's IPv4 address on the LAN or VPN. Leave the port blank to use 47584.", rtl);
+    ImGui::Spacing();
+
+    const char* add_label = label("Find friend", "پیدا کردن دوست");
+    bool submitted = false;
+    auto address_input = [&] {
+        overlay_line(label("IPv4 address", "نشانی آی‌پی"), rtl);
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputTextWithHint("##peer_address", "10.0.0.15", peer_address,
+            sizeof(peer_address), ImGuiInputTextFlags_EnterReturnsTrue)) submitted = true;
+    };
+    auto port_input = [&] {
+        overlay_line(label("Port", "پورت"), rtl);
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputTextWithHint("##peer_port", "47584", peer_port,
+            sizeof(peer_port), ImGuiInputTextFlags_EnterReturnsTrue)) submitted = true;
+    };
+    auto add_button = [&] {
+        ImGui::BeginDisabled(!network);
+        if (overlay_button(add_label, rtl)) submitted = true;
+        ImGui::EndDisabled();
+    };
+
+    const float button_width = ImGui::CalcTextSize(add_label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float min_inline_width = button_width + ImGui::GetFontSize() * 14.0f;
+    if (ImGui::GetContentRegionAvail().x >= min_inline_width
+        && ImGui::BeginTable("##peer_form", 3, ImGuiTableFlags_SizingStretchProp)) {
+        const int ip_col = rtl ? 2 : 0;
+        const int port_col = 1;
+        const int action_col = rtl ? 0 : 2;
+        auto setup_action = [&] {
+            ImGui::TableSetupColumn("##submit", ImGuiTableColumnFlags_WidthFixed, button_width);
+        };
+        auto setup_ip = [] {
+            ImGui::TableSetupColumn("##address", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        };
+        if (rtl) setup_action();
+        else setup_ip();
+        ImGui::TableSetupColumn("##port", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+        if (rtl) setup_ip();
+        else setup_action();
+
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(ip_col);
+        address_input();
+        ImGui::TableSetColumnIndex(port_col);
+        port_input();
+        ImGui::TableSetColumnIndex(action_col);
+        ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
+        add_button();
+        ImGui::EndTable();
+    } else {
+        address_input();
+        port_input();
+        add_button();
+    }
+
+    if (network && submitted) {
+        peer_action_error.clear();
+        std::string endpoint = normalize_ip_field(peer_address);
+        const std::string port = normalize_ip_field(peer_port);
+        if (endpoint.find(':') != std::string::npos) {
+            peer_action_error = rtl ? "پورت را در کادر جداگانه وارد کنید." : "Enter the port in the separate Port field.";
+        } else {
+            if (!port.empty()) endpoint += ':' + port;
+            if (network->add_custom_endpoint(endpoint, peer_action_error)) {
+                peer_address[0] = '\0';
+                peer_port[0] = '\0';
+            }
+        }
+    }
+
+    if (!peer_action_error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, warning);
+        if (rtl) overlay_line(label("Address update failed", "به‌روزرسانی آدرس انجام نشد"), true);
+        overlay_paragraph(peer_action_error.c_str(), rtl);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (!network) {
+        ImGui::PushStyleColor(ImGuiCol_Text, warning);
+        overlay_line(label("Network is unavailable.", "شبکه در دسترس نیست."), rtl);
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    bool automatic = discovery.automatic_discovery;
+    if (overlay_checkbox(label("Discover nearby players automatically", "کشف خودکار بازیکنان در شبکه"), &automatic, rtl)) {
+        network->set_automatic_discovery(automatic);
+    }
+    if (!automatic) {
+        overlay_paragraph(rtl
+            ? "فقط بازیکنانی که دستی اضافه می‌کنید در فهرست دوستان نمایش داده می‌شوند."
+            : "Friends shows only players you add by address.", rtl);
+    }
+
+    if (discovery.enabled) {
+        const std::string ports = "UDP " + std::to_string(discovery.udp_port) + "   /   TCP " + std::to_string(discovery.tcp_port);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        overlay_line(ports.c_str(), rtl);
+        ImGui::PopStyleColor();
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= refresh_local_addresses_at) {
+            local_addresses = network->get_local_vpn_ips();
+            refresh_local_addresses_at = now + std::chrono::seconds(5);
+        }
+        if (!local_addresses.empty() && ImGui::CollapsingHeader(label("Addresses on this PC", "آدرس‌های این دستگاه"))) {
+            for (const auto &address : local_addresses) {
+                const std::string endpoint = address + ":" + std::to_string(discovery.udp_port);
+                const char* copy = label("Copy", "کپی");
+                ImGui::PushID(endpoint.c_str());
+                if (rtl) {
+                    const float width = ImGui::CalcTextSize(copy).x + ImGui::CalcTextSize(endpoint.c_str()).x
+                        + ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+                    align_overlay_item_right(width);
+                    if (ImGui::SmallButton(copy)) ImGui::SetClipboardText(endpoint.c_str());
+                    ImGui::SameLine();
+                }
+                ImGui::TextUnformatted(endpoint.c_str());
+                if (!rtl) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(copy)) ImGui::SetClipboardText(endpoint.c_str());
+                }
+                ImGui::PopID();
+            }
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, warning);
+        overlay_paragraph(rtl
+            ? "جست‌وجوی شبکه در این بازی فعال نیست یا در دسترس نیست."
+            : "Network discovery is disabled or unavailable for this game.", rtl);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    const auto visible_peer = [automatic](const auto& peer) { return automatic || peer.editable; };
+    if (std::none_of(discovery.peers.begin(), discovery.peers.end(), visible_peer)) {
+        if (discovery.enabled) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            overlay_line(label("No saved addresses", "آدرس ذخیره‌شده‌ای وجود ندارد"), rtl);
+            ImGui::PopStyleColor();
+        }
+        return;
+    }
+    if (!ImGui::BeginTable("##peer_status", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) return;
+
+    const int address_col = rtl ? 2 : 0;
+    const int status_col = 1;
+    const int action_col = rtl ? 0 : 2;
+    const char* address_title = label("Address", "آدرس");
+    const char* status_title = label("Status", "وضعیت");
+    const char* remove = label("Remove", "حذف");
+    auto setup_address = [&] { ImGui::TableSetupColumn(address_title, ImGuiTableColumnFlags_WidthStretch, 1.05f); };
+    auto setup_action = [&] {
+        ImGui::TableSetupColumn("##peer_actions", ImGuiTableColumnFlags_WidthFixed,
+            ImGui::CalcTextSize(remove).x + ImGui::GetStyle().FramePadding.x * 2.0f);
+    };
+    if (rtl) setup_action();
+    else setup_address();
+    ImGui::TableSetupColumn(status_title, ImGuiTableColumnFlags_WidthStretch, 1.35f);
+    if (rtl) setup_address();
+    else setup_action();
+    ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+    ImGui::TableSetColumnIndex(address_col);
+    overlay_line(address_title, rtl);
+    ImGui::TableSetColumnIndex(status_col);
+    overlay_line(status_title, rtl);
+
+    for (const auto &peer : discovery.peers) {
+        if (!visible_peer(peer)) continue;
+
+        const char* status = label("Waiting to search", "در انتظار جست‌وجو");
+        ImVec4 color = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        switch (peer.state) {
+            case PeerDiscoveryState::Waiting:
+                if (!discovery.enabled) status = label("Unavailable", "در دسترس نیست");
+                break;
+            case PeerDiscoveryState::Searching:
+                status = label("Searching", "در حال جست‌وجو");
+                color = accent;
+                break;
+            case PeerDiscoveryState::Discovered:
+                status = label("Peer discovered", "همتا پیدا شد");
+                color = accent;
+                break;
+            case PeerDiscoveryState::Connected:
+                status = label("Peer connected", "همتا متصل شد");
+                color = ImVec4(0.36f, 0.82f, 0.69f, 1.0f);
+                break;
+            case PeerDiscoveryState::SendFailed:
+                status = label("Send failed", "ارسال ناموفق");
+                color = warning;
+                break;
+        }
+
+        ImGui::PushID(peer.endpoint.c_str());
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(address_col);
+        overlay_line(peer.endpoint.c_str(), rtl);
+        ImGui::TableSetColumnIndex(status_col);
+        const auto error = peer.socket_error ? "(" + std::to_string(peer.socket_error) + ")" : std::string{};
+        const auto status_text = error.empty() ? status : rtl ? error + " " + status : status + (" " + error);
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+        overlay_line(status_text.c_str(), rtl);
+        ImGui::PopStyleColor();
+        ImGui::TableSetColumnIndex(action_col);
+        if (peer.editable && ImGui::SmallButton(remove)) {
+            peer_action_error.clear();
+            network->remove_custom_endpoint(peer.endpoint, peer_action_error);
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+}
+
 void Steam_Overlay::render_main_window()
 {
-    char tmp[TRANSLATION_BUFFER_SIZE]{};
-    snprintf(tmp, sizeof(tmp), translationRenderer[current_language], (_renderer == nullptr ? "Unknown" : _renderer->GetLibraryName()));
-    std::string windowTitle{};
-    // Note: don't translate this, project and author names are nouns, they must be kept intact for proper referral
-    // think of it as translating "Protobuf - Google"
-    windowTitle.append("Ingame Overlay project - Nemirtingas (").append(tmp).append(")");
+    const bool is_fa = (current_language == PERSIAN_LANG_INDEX);
+    auto label = [this](const char* english, const char* persian) {
+        return overlay_label(current_language, english, persian);
+    };
 
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    if (display.x < 40.0f || display.y < 40.0f) return;
+    const ImVec2 size(std::min(display.x - 20.0f, 1060.0f), std::min(display.y - 20.0f, 710.0f));
+    const bool wide = size.x >= 740.0f;
     bool show = true;
 
-    ImGuiIO &io = ImGui::GetIO();
-
     ImGui::PushFont(font_default);
-    uint32 style_color_stack = apply_global_style_color();
+    const uint32 style_color_stack = apply_global_style_color();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 14.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 9.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 9.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 7.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), display, IM_COL32(5, 8, 14, 151));
 
-    ImGui::SetNextWindowPos({ 0, 0 });
-    ImGui::SetNextWindowSize({ io.DisplaySize.x, io.DisplaySize.y });
-    if (ImGui::Begin(windowTitle.c_str(), &show,
-            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoBringToFrontOnFocus)) {
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove
+        | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar;
+    if (ImGui::Begin("SteamEM###MainOverlayWnd", nullptr, flags)) {
+        const char* close = tr_ui(current_language, translationClose, "بستن");
+        const float close_width = ImGui::CalcTextSize(close).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float title_width = ImGui::CalcTextSize("SteamEM").x;
+        const float gap = ImGui::GetStyle().ItemSpacing.x;
+        const float header_width = ImGui::GetContentRegionAvail().x;
+        const float header_right = ImGui::GetCursorPosX() + header_width;
+        const float name_width = header_width - close_width - title_width - gap * 2.0f;
+        const auto local_name = wide ? fa_shape(displayed_local_name) : std::string{};
+        const float local_name_width = ImGui::CalcTextSize(local_name.c_str()).x;
+        const bool name_fits = wide && !local_name.empty() && local_name_width <= name_width;
+        auto render_title = [] {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(ImVec4(0.56f, 0.83f, 1.0f, 1.0f), "SteamEM");
+        };
+        if (is_fa) {
+            if (ImGui::Button(close)) show = false;
+            if (name_fits) {
+                ImGui::SameLine(header_right - title_width - gap - local_name_width);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextDisabled("%s", local_name.c_str());
+            }
+            ImGui::SameLine(std::max(0.0f, header_right - title_width));
+            render_title();
+        } else {
+            render_title();
+            if (name_fits) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", local_name.c_str());
+            }
+            ImGui::SameLine(std::max(0.0f, header_right - close_width));
+            if (ImGui::Button(close)) show = false;
+        }
+
         if (show_user_info) {
-            ImGui::LabelText("##playinglabel", translationUserPlaying[current_language],
-                settings->get_local_name(),
-                settings->get_local_steam_id().ConvertToUint64(),
-                settings->get_local_game_id().AppID());
-
+            const auto* renderer_name = _renderer ? _renderer->GetLibraryName() : "";
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            char details[200]{};
+            snprintf(details, sizeof(details), "SteamID %" PRIu64 "  /  AppID %u  /  %s",
+                settings->get_local_steam_id().ConvertToUint64(), displayed_app_id, renderer_name);
+            overlay_paragraph(details, is_fa);
+            ImGui::PopStyleColor();
             if (settings->record_playtime && playtime_counter && settings->overlay_appearance.show_playtime_in_user_info) {
-                uint64_t session_sec = playtime_counter->session_seconds();
-                unsigned ss = static_cast<unsigned>(session_sec % 60);
-                unsigned mm = static_cast<unsigned>((session_sec / 60) % 60);
-                unsigned hh = static_cast<unsigned>(session_sec / 3600);
-
-                uint64_t total_sec = playtime_counter->seconds();
-                unsigned total_h = static_cast<unsigned>(total_sec / 3600);
-                unsigned total_m = static_cast<unsigned>((total_sec % 3600) / 60);
-
-                char total_buf[32]{};
-                char session_buf[32]{};
-                snprintf(total_buf, sizeof(total_buf), translationTotalTime[current_language], total_h, total_m);
-                snprintf(session_buf, sizeof(session_buf), "%02u:%02u:%02u", hh, mm, ss);
-
-                ImGui::LabelText("##playtime", translationTotalTimeText[current_language], total_buf, session_buf);
+                const uint64_t total = playtime_counter->seconds();
+                const uint64_t session = playtime_counter->session_seconds();
+                char total_text[32]{};
+                char session_text[32]{};
+                snprintf(total_text, sizeof(total_text), "%02u:%02u", static_cast<unsigned>(total / 3600),
+                    static_cast<unsigned>(total / 60 % 60));
+                snprintf(session_text, sizeof(session_text), "%02u:%02u:%02u", static_cast<unsigned>(session / 3600),
+                    static_cast<unsigned>(session / 60 % 60), static_cast<unsigned>(session % 60));
+                char duration[256]{};
+                snprintf(duration, sizeof(duration), is_fa ? "زمان کل %s  /  نشست فعلی %s"
+                    : translationTotalTimeText[current_language], total_text, session_text);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                overlay_paragraph(duration, is_fa);
+                ImGui::PopStyleColor();
             }
         }
+        ImGui::Separator();
 
-        ImGui::Spacing();
+        const struct {
+            OverlayPage page;
+            const char* title;
+            bool visible;
+        } pages[] = {
+            { OverlayPage::Friends, tr_ui(current_language, translationFriends, "دوستان"), true },
+            { OverlayPage::Network, label("Network", "شبکه"), true },
+            { OverlayPage::Achievements, tr_ui(current_language, translationAchievements, "دستاوردها"), settings->overlay_show_button_achievements },
+            { OverlayPage::Activity, tr_ui(current_language, translationHistory, "تاریخچه"), settings->overlay_show_button_history },
+            { OverlayPage::Settings, tr_ui(current_language, translationSettings, "تنظیمات"), settings->overlay_show_button_settings },
+        };
+        const char* current_page = pages[0].title;
+        for (const auto &page : pages) {
+            if (page.page == active_page && page.visible) current_page = page.title;
+        }
+        const char* screenshots = tr_ui(current_language, translationScreenshots, "تصاویر بازی");
 
-        if (settings->overlay_show_button_user_info) {
+        const float side_width = std::clamp(size.x * 0.23f, 164.0f, 224.0f);
+        const auto render_sidebar = [&] {
+            ImGui::BeginChild("##overlay_navigation", ImVec2(side_width, 0), true);
+            ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(is_fa ? 0.94f : 0.06f, 0.5f));
+            for (const auto &page : pages) {
+                if (!page.visible) continue;
+                ImGui::PushID(static_cast<int>(page.page));
+                const auto color = page.page == active_page ? ImGuiCol_ButtonActive : ImGuiCol_ChildBg;
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(color));
+                if (ImGui::Button(page.title, ImVec2(-1, ImGui::GetFrameHeight() + 7.0f))) active_page = page.page;
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+            }
+            if (settings->overlay_show_button_screenshots) {
+                ImGui::Separator();
+                if (ImGui::Button(screenshots, ImVec2(-1, ImGui::GetFrameHeight() + 7.0f))) {
+                    show_screenshots_window = !show_screenshots_window;
+                }
+            }
+            ImGui::PopStyleVar();
+            ImGui::EndChild();
+        };
+        if (wide && !is_fa) {
+            render_sidebar();
             ImGui::SameLine();
-            // user clicked on "toggle user info"
-            if (ImGui::Button(translationToggleUserInfo[current_language])) {
-                show_user_info = !show_user_info;
+        } else if (!wide) {
+            const float screenshots_width = ImGui::CalcTextSize(screenshots).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            const bool inline_gallery = settings->overlay_show_button_screenshots
+                && ImGui::GetContentRegionAvail().x > screenshots_width + 130.0f;
+            const float selector_width = inline_gallery
+                ? ImGui::GetContentRegionAvail().x - screenshots_width - ImGui::GetStyle().ItemSpacing.x
+                : -1.0f;
+            if (is_fa && inline_gallery) {
+                if (ImGui::Button(screenshots)) show_screenshots_window = !show_screenshots_window;
+                ImGui::SameLine();
+            }
+            ImGui::SetNextItemWidth(selector_width);
+            if (ImGui::BeginCombo("##overlay_navigation", current_page)) {
+                ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(is_fa ? 1.0f : 0.0f, 0.5f));
+                for (const auto &page : pages) {
+                    if (page.visible && ImGui::Selectable(page.title, page.page == active_page)) active_page = page.page;
+                }
+                ImGui::PopStyleVar();
+                ImGui::EndCombo();
+            }
+            if (settings->overlay_show_button_screenshots && (!is_fa || !inline_gallery)) {
+                if (inline_gallery) ImGui::SameLine();
+                if (overlay_button(screenshots, is_fa)) show_screenshots_window = !show_screenshots_window;
             }
         }
 
-        if (settings->overlay_show_button_achievements) {
-            ImGui::SameLine();
-            // user clicked on "show achievements"
-            if (ImGui::Button(translationShowAchievements[current_language])) {
-                show_achievements = !show_achievements;
-            }
-        }
-
-        if (settings->overlay_show_button_test_achievement) {
-            ImGui::SameLine();
-            // user clicked on "test achievement"
-            if (ImGui::Button(translationTestAchievement[current_language])) {
-                show_test_achievement();
-            }
-        }
-
-        if (settings->overlay_show_button_copy_id) {
-            ImGui::SameLine();
-            // user clicked on "copy id" on themselves
-            if (ImGui::Button(translationCopyId[current_language])) {
-                auto friend_id_str = std::to_string(settings->get_local_steam_id().ConvertToUint64());
-                ImGui::SetClipboardText(friend_id_str.c_str());
-            }
-        }
-
-        if (settings->overlay_show_button_screenshots) {
-            ImGui::SameLine();
-            // user clicked on "Screenshots"
-            if (ImGui::Button(translationScreenshots[current_language])) {
-                show_screenshots_window = !show_screenshots_window;
-            }
-		}
-
-        if (settings->overlay_show_button_history) {
-            ImGui::SameLine();
-            // user clicked on "notification history"
-            if (ImGui::Button(translationHistory[current_language])) {
-                show_notification_history = !show_notification_history;
-            }
-        }
-
-        if (settings->overlay_show_button_settings) {
-            ImGui::SameLine();
-            // user clicked on "settings"
-            if (ImGui::Button(translationSettings[current_language])) {
-                show_settings = !show_settings;
-            }
-        }
-        
-        ImGui::Spacing();
-        ImGui::Spacing();
-        // user clicked on "FPS"
-        if (settings->overlay_show_checkbox_fps) {
-            ImGui::SameLine();
-            if (ImGui::Checkbox(translationFpsCheckbox[current_language], &stats.show_fps)) {
-                allow_renderer_frame_processing(stats.show_fps);
-            }
-        }
-        
-        // user clicked on "Frametime"
-        ImGui::SameLine();
-        if (settings->overlay_show_checkbox_frametime) {
-            if (ImGui::Checkbox(translationFrametimeCheckbox[current_language], &stats.show_frametime)) {
-                allow_renderer_frame_processing(stats.show_frametime);
-            }
-        }
-        
-        // user clicked on "Playtime"
-        ImGui::SameLine();
-        if (settings->overlay_show_checkbox_playtime) {
-            if (ImGui::Checkbox(translationPlaytimeCheckbox[current_language], &stats.show_playtime)) {
-                allow_renderer_frame_processing(stats.show_playtime);
-            }
-        }
-        
-        ImGui::Spacing();
-        ImGui::Spacing();
-
-        // --- Notification history panel ---
-        if (show_notification_history) {
-            if (ImGui::Button(translationClearAll[current_language])) {
-                notification_history.clear();
-                notification_history_cache.clear();
-                notification_history_cache_dirty = false;
-            }
-            ImGui::Separator();
-            if (notification_history.empty()) {
-                ImGui::TextDisabled(translationNoNotification[current_language]);
+        const float body_width = wide && is_fa
+            ? ImGui::GetContentRegionAvail().x - side_width - ImGui::GetStyle().ItemSpacing.x
+            : 0.0f;
+        const auto discovery = network ? network->peer_discovery_snapshot() : PeerDiscoverySnapshot{};
+        ImGui::BeginChild("##overlay_content", ImVec2(body_width, 0.0f), true);
+        if (active_page == OverlayPage::Friends) {
+            render_friends_page(discovery);
+        } else if (active_page == OverlayPage::Network) {
+            render_network_page(discovery);
+        } else if (active_page == OverlayPage::Achievements) {
+            if (achievements.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                overlay_paragraph(is_fa ? "هیچ دستاوردی برای این بازی ثبت نشده است."
+                    : "No achievements configured for this game.", is_fa);
+                ImGui::PopStyleColor();
             } else {
-                ImGui::BeginChild("##history_scroll", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 10), true);
-
-                // Rebuild cache only when history actually changes
-                if (notification_history_cache_dirty) {
-                    notification_history_cache.clear();
-                    notification_history_cache.reserve(notification_history.size());
-
-                    for (auto it = notification_history.rbegin(); it != notification_history.rend(); ++it) {
-                        // Format timestamp HH:MM:SS in local timezone
-                        const time_t total_sec = std::chrono::duration_cast<std::chrono::seconds>(it->timestamp).count();
-                        struct tm local_tm_buf{};
-#ifdef _MSC_VER
-                        localtime_s(&local_tm_buf, &total_sec);
-#else
-                        localtime_r(&total_sec, &local_tm_buf);
-#endif
-                        const auto hr = local_tm_buf.tm_hour;
-                        const auto min = local_tm_buf.tm_min;
-                        const auto sec = local_tm_buf.tm_sec;
-
-                        // Type label
-                        const char *type_label = "?";
-                        switch ((notification_type)it->type) {
-                            case notification_type::message: type_label = translationHistoryChat[current_language]; break;
-                            case notification_type::invite: type_label = translationHistoryInvite[current_language]; break;
-                            case notification_type::achievement: type_label = translationHistoryAchievement[current_language]; break;
-                            case notification_type::achievement_progress: type_label = translationHistoryProgress[current_language]; break;
-                            case notification_type::auto_accept_invite: type_label = translationHistoryAutoInvite[current_language]; break;
-                            case notification_type::screenshot: type_label = translationHistoryScreenshot[current_language]; break;
-                        }
-
-                        // For achievements the message contains "title\ndescription"
-                        // Replace newline with inline separator for compact display
-                        std::string display_msg = it->message;
-                        if (it->type == static_cast<uint8>(notification_type::achievement) ||
-                            it->type == static_cast<uint8>(notification_type::achievement_progress)) {
-                            size_t pos = display_msg.find('\n');
-                            if (pos != std::string::npos) {
-                                display_msg.replace(pos, 1, " — ");
-                            }
-                        }
-
-                        std::string line = (std::ostringstream{}
-                            << "[" << std::setw(2) << std::setfill('0') << hr << ":"
-                            << std::setw(2) << std::setfill('0') << min << ":"
-                            << std::setw(2) << std::setfill('0') << sec << "] "
-                            << type_label << "  "
-                            << display_msg).str();
-
-                        notification_history_cache.push_back(std::move(line));
-                    }
-                    notification_history_cache_dirty = false;
-                }
-
-                // Render from cache
-                for (const auto &line : notification_history_cache) {
-                    ImGui::TextWrapped("%s", line.c_str());
-                    ImGui::Separator();
-                }
-                ImGui::EndChild();
-            }
-        }
-
-        ImGui::LabelText("##label", "%s", translationFriends[current_language]);
-
-        if (!friends.empty()) {
-            if (i_have_lobby) {
-                std::string inviteAll(translationInviteAll[current_language]);
-                inviteAll.append("##PopupInviteAllFriends");
-                if (ImGui::Button(inviteAll.c_str())) { // if btn clicked
-                    invite_all_friends_clicked = true;
-                }
-            }
-
-            if (ImGuiHelper_BeginListBox("##label", static_cast<int>(friends.size()))) {
-                std::for_each(friends.begin(), friends.end(), [this](std::pair<Friend const, friend_window_state> &i) {
-                    ImGui::PushID(i.second.id-base_friend_window_id+base_friend_item_id);
-
-                    ImGui::Selectable(i.second.window_title.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick);
-                    build_friend_context_menu(i.first, i.second);
-                    if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(0)) {
-                        i.second.window_state |= window_state_show;
-                    }
-
-                    ImGui::PopID();
-
-                    build_friend_window(i.first, i.second);
-                });
-                ImGui::EndListBox();
-            }
-        }
-
-        // user clicked on "show achievements" button
-        if (show_achievements && achievements.size()) {
-            ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 32, ImGui::GetFontSize() * 32), ImVec2(8192, 8192));
-            ImGui::SetNextWindowBgAlpha(1.0f);
-            ImGui::SetNextWindowPos(ImVec2(ImGui::GetFontSize() * 4, std::max(ImGui::GetFontSize() * 10, io.DisplaySize.y * 0.15f)), ImGuiCond_FirstUseEver);
-            if (ImGui::Begin(translationAchievementWindow[current_language], &show_achievements)) {
-                ImGui::Text("%s", translationListOfAchievements[current_language]);
-                ImGui::BeginChild(translationAchievements[current_language]);
-
-                // Build sorted index lists: unlocked by time desc, locked in API order
                 std::vector<size_t> unlocked_idx, locked_idx;
-                unlocked_idx.reserve(achievements.size());
-                locked_idx.reserve(achievements.size());
                 for (size_t i = 0; i < achievements.size(); ++i) {
-                    if (achievements[i].achieved)
-                        unlocked_idx.push_back(i);
-                    else
-                        locked_idx.push_back(i);
+                    if (achievements[i].achieved) unlocked_idx.push_back(i);
+                    else locked_idx.push_back(i);
                 }
-                std::sort(unlocked_idx.begin(), unlocked_idx.end(),
-                    [this](size_t a, size_t b) {
-                        return achievements[a].unlock_time > achievements[b].unlock_time;
-                    });
-                std::sort(locked_idx.begin(), locked_idx.end(),
-                    [this](size_t a, size_t b) {
-                        float pct_a = achievements[a].unlock_percentage;
-                        float pct_b = achievements[b].unlock_percentage;
-                        if (pct_a < 0.0f && pct_b < 0.0f) return false;
-                        if (pct_a < 0.0f) return false;
-                        if (pct_b < 0.0f) return true;
-                        return pct_a > pct_b;
-                    });
 
-                // Lambda to render a single achievement card
-                auto render_ach = [this](Overlay_Achievement &x) {
+                float ratio = static_cast<float>(unlocked_idx.size()) / static_cast<float>(achievements.size());
+                char prog_overlay[64]{};
+                snprintf(prog_overlay, sizeof(prog_overlay), "%zu / %zu (%.1f%%)", unlocked_idx.size(), achievements.size(), ratio * 100.0f);
+                ImGui::ProgressBar(ratio, ImVec2(-1.0f, 22.0f), prog_overlay);
+                ImGui::Spacing();
+
+                std::sort(unlocked_idx.begin(), unlocked_idx.end(), [this](size_t a, size_t b) {
+                    return achievements[a].unlock_time > achievements[b].unlock_time;
+                });
+
+                auto render_ach = [this, is_fa](Overlay_Achievement &x) {
                     const bool achieved = x.achieved;
                     const bool hidden = x.hidden && !achieved;
-
-                    if (x.unlock_percentage < 0.0f && x.name.size()) {
-                        x.unlock_percentage = static_cast<float>(
-                            get_steam_client()->steam_user_stats->GetAchievementUnlockPercentage(x.name.c_str()));
-                    }
-
-                    // Load only the icon matching the current state.
-                    // The other variant is loaded by the background pagination or on state change.
                     try_load_ach_icon(x, achieved, settings->paginated_achievements_icons == 0);
 
                     ImGui::Separator();
-
                     bool could_create_ach_table_entry = false;
                     if (x.icon->GetResourceId() != 0 || x.icon_gray->GetResourceId() != 0) {
-                        if (ImGui::BeginTable(x.title.c_str(), 2)) {
+                        if (ImGui::BeginTable(x.name.c_str(), 2)) {
                             could_create_ach_table_entry = true;
-
-                            ImGui::TableSetupColumn("imgui_table_image", ImGuiTableColumnFlags_WidthFixed, settings->overlay_appearance.icon_size);
-                            ImGui::TableSetupColumn("imgui_table_text");
+                            ImGui::TableSetupColumn("img", ImGuiTableColumnFlags_WidthFixed, settings->overlay_appearance.icon_size);
+                            ImGui::TableSetupColumn("txt");
                             ImGui::TableNextRow(ImGuiTableRowFlags_None, settings->overlay_appearance.icon_size);
-
                             ImGui::TableSetColumnIndex(0);
                             auto &icon_rsrc = achieved ? x.icon : x.icon_gray;
                             if (icon_rsrc->GetResourceId() != 0) {
-                                ImGui::Image(
-                                    icon_rsrc->GetResourceId(),
-                                    ImVec2(settings->overlay_appearance.icon_size, settings->overlay_appearance.icon_size)
-                                );
-
-                                if (achieved && x.unlock_percentage >= 0.0f && x.unlock_percentage <= 10.0f) {
-                                    const ImVec2 icon_min = ImGui::GetItemRectMin();
-                                    const ImVec2 icon_max = ImGui::GetItemRectMax();
-                                    ImDrawList* dl = ImGui::GetWindowDrawList();
-                                    // Glowing border: a solid gold inner line + a few semi-transparent
-                                    // concentric outlines expanding outward, fading to transparent.
-                                    const float rounding = settings->overlay_appearance.notification_rounding;
-                                    const int   steps = 3;
-                                    const float step_px = 1.5f;
-                                    const float max_expand = step_px * (float)steps;
-                                    // Clip to the child window bounds on Y so the glow doesn't
-                                    // bleed when the achievement scrolls out of view, but still
-                                    // extend past the table cell on X for the full glow width.
-                                    const ImVec2 win_min = ImGui::GetWindowPos();
-                                    const ImVec2 win_max = ImVec2(
-                                        win_min.x + ImGui::GetWindowWidth(),
-                                        win_min.y + ImGui::GetWindowHeight());
-                                    dl->PushClipRect(
-                                        ImVec2(icon_min.x - max_expand, (std::max)(icon_min.y - max_expand, win_min.y)),
-                                        ImVec2(icon_max.x + max_expand, (std::min)(icon_max.y + max_expand, win_max.y)),
-                                        false);
-                                    for (int i = steps; i >= 1; --i) {
-                                        float expand = step_px * (float)i;
-                                        ImVec2 lo(icon_min.x - expand, icon_min.y - expand);
-                                        ImVec2 hi(icon_max.x + expand, icon_max.y + expand);
-                                        int a = (int)(90.0f * (1.0f - (float)(i - 1) / (float)steps));
-                                        dl->AddRect(lo, hi, IM_COL32(218, 165, 32, a), rounding + expand, 0, 2.0f);
-                                    }
-                                    // Solid bright inner line
-                                    dl->AddRect(icon_min, icon_max,
-                                                IM_COL32(255, 215, 90, 220), rounding, 0, 2.0f);
-                                    dl->PopClipRect();
-                                }
+                                ImGui::Image(icon_rsrc->GetResourceId(), ImVec2(settings->overlay_appearance.icon_size, settings->overlay_appearance.icon_size));
                             }
-
                             ImGui::TableSetColumnIndex(1);
-                            // the next column is the achievement text below
                         }
                     }
 
-                    ImGui::Text("%s", x.title.c_str());
-                    if (x.unlock_percentage >= 0.0f) {
-                        float display_pct = x.unlock_percentage;
-                        if (display_pct < 0.1f) {
-                            display_pct = 0.1f;
-                        }
-                        char pct_buf[32];
-                        snprintf(pct_buf, sizeof(pct_buf), "%.1f%%", display_pct);
-                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(pct_buf).x);
-                        if (achieved && x.unlock_percentage <= 10.0f) {
-                            ImGui::TextColored(ImVec4(218.0f / 255.0f, 165.0f / 255.0f, 32.0f / 255.0f, 1.0f), "%s", pct_buf);
-                        } else {
-                            ImGui::TextDisabled("%s", pct_buf);
-                        }
-                    }
+                    ImGui::PushStyleColor(ImGuiCol_Text, achieved
+                        ? ImVec4(0.4f, 0.95f, 0.5f, 1.0f) : ImVec4(0.9f, 0.9f, 0.9f, 1.0f));
+                    overlay_line(fa_shape(x.title).c_str(), is_fa);
+                    ImGui::PopStyleColor();
 
                     if (hidden) {
-                        ImGui::Text("%s", translationHiddenAchievement[current_language]);
+                        ImGui::TextDisabled("%s", tr_ui(current_language, translationHiddenAchievement, "دستاورد مخفی"));
                         ImGui::SameLine();
-
                         ImGui::PushID(&x);
-                        ImGui::SmallButton(translationShow[current_language]);
-                        bool show = ImGui::IsItemActive();
+                        ImGui::SmallButton(tr_ui(current_language, translationShow, "نمایش"));
+                        bool show_desc = ImGui::IsItemActive();
                         ImGui::PopID();
-
-                        if (show) {
-                            ImGui::TextWrapped("%s", x.description.c_str());
-                        }
+                        if (show_desc) overlay_paragraph(x.description.c_str(), is_fa);
                     } else {
-                        ImGui::TextWrapped("%s", x.description.c_str());
+                        overlay_paragraph(x.description.c_str(), is_fa);
                     }
 
                     if (achieved) {
@@ -2288,131 +2634,148 @@ void Steam_Overlay::render_main_window()
 #else
                         localtime_r(&unlock_time, &unlock_tm);
 #endif
-                        size_t written = std::strftime(buffer, sizeof(buffer), settings->overlay_appearance.ach_unlock_datetime_format.c_str(), &unlock_tm);
-                        if (!written) {
-                            std::strftime(buffer, sizeof(buffer), "%Y/%m/%d - %H:%M:%S", &unlock_tm);
+                        std::strftime(buffer, sizeof(buffer), "%Y/%m/%d - %H:%M:%S", &unlock_tm);
+                        if (is_fa) {
+                            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "%s %s", fa_shape("باز شده در تاریخ:").c_str(), buffer);
+                        } else {
+                            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), translationAchievedOn[current_language], buffer);
                         }
-
-                        ImGui::TextColored(ImVec4(0, 255, 0, 255), translationAchievedOn[current_language], buffer);
                     } else {
-                        ImGui::TextColored(ImVec4(255, 0, 0, 255), "%s", translationNotAchieved[current_language]);
+                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", tr_ui(current_language, translationNotAchieved, "قفل شده"));
                     }
 
                     add_ach_progressbar(x);
-
                     if (could_create_ach_table_entry) ImGui::EndTable();
-
-                    ImGui::Separator();
                 };
 
-                // --- Unlocked section ---
-                if (ImGui::CollapsingHeader(translationUnlocked[current_language], settings->overlay_appearance.unlocked_expanded ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None)) {
-                    if (unlocked_idx.empty()) {
-                        ImGui::TextDisabled(translationNoUnlockedAchievements[current_language]);
-                    } else {
-                        for (auto idx : unlocked_idx) {
-                            render_ach(achievements[idx]);
-                        }
-                    }
+                if (ImGui::CollapsingHeader(tr_ui(current_language, translationUnlocked, "دستاوردهای باز شده"), ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (unlocked_idx.empty()) ImGui::TextDisabled("%s", tr_ui(current_language, translationNoUnlockedAchievements, "هنوز هیچ دستاوردی باز نشده است."));
+                    else for (auto idx : unlocked_idx) render_ach(achievements[idx]);
                 }
-
-                // --- Locked section ---
-                if (ImGui::CollapsingHeader(translationLocked[current_language], settings->overlay_appearance.locked_expanded ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None)) {
-                    if (locked_idx.empty()) {
-                        ImGui::TextDisabled(translationAllAchievementsUnlocked[current_language]);
-                    } else {
-                        for (auto idx : locked_idx) {
-                            render_ach(achievements[idx]);
-                        }
-                    }
-                }
-
-                ImGui::EndChild();
-            }
-
-            ImGui::End();
-        }
-
-        // user clicked on "settings" button
-        if (show_settings) {
-            ImGui::SetNextWindowBgAlpha(1.0f);
-            if (ImGui::Begin(translationGlobalSettingsWindow[current_language], &show_settings)) {
-                ImGui::Text("%s", translationGlobalSettingsWindowDescription[current_language]);
-
-                ImGui::Separator();
-
-                ImGui::Text("%s", translationUsername[current_language]);
-                ImGui::SameLine();
-                ImGui::InputText("##username", username_text, sizeof(username_text), 0);
-
-                ImGui::Separator();
-
-                ImGui::Text("%s", translationLanguage[current_language]);
-                ImGui::ListBox("##language", &current_language, valid_languages, sizeof(valid_languages) / sizeof(valid_languages[0]), 7);
-                ImGui::Text(translationSelectedLanguage[current_language], valid_languages[current_language]);
-
-                ImGui::Separator();
-
-                ImGui::Text("%s", translationRestartTheGameToApply[current_language]);
-                if (ImGui::Button(translationSave[current_language])) {
-                    save_settings = true;
-                    show_settings = false;
+                if (ImGui::CollapsingHeader(tr_ui(current_language, translationLocked, "دستاوردهای قفل شده"), ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (locked_idx.empty()) ImGui::TextDisabled("%s", tr_ui(current_language, translationAllAchievementsUnlocked, "تمام دستاوردها باز شده‌اند!"));
+                    else for (auto idx : locked_idx) render_ach(achievements[idx]);
                 }
             }
-
-            ImGui::End();
         }
 
-        // we have a url to open/display
+        // -------------------- تب ۳: تاریخچه اعلان‌ها --------------------
+        else if (active_page == OverlayPage::Activity) {
+            if (overlay_button(tr_ui(current_language, translationClearAll, "پاک کردن همه"), is_fa)) {
+                notification_history.clear();
+                notification_history_cache.clear();
+                notification_history_cache_dirty = false;
+            }
+            ImGui::Separator();
+            if (notification_history.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                overlay_line(tr_ui(current_language, translationNoNotification, "هیچ اعلانی ثبت نشده است."), is_fa);
+                ImGui::PopStyleColor();
+            } else {
+                for (auto it = notification_history.rbegin(); it != notification_history.rend(); ++it) {
+                    const time_t total_sec = std::chrono::duration_cast<std::chrono::seconds>(it->timestamp).count();
+                    struct tm local_tm_buf{};
+#ifdef _MSC_VER
+                    localtime_s(&local_tm_buf, &total_sec);
+#else
+                    localtime_r(&total_sec, &local_tm_buf);
+#endif
+                    char time_prefix[32]{};
+                    snprintf(time_prefix, sizeof(time_prefix), "[%02d:%02d:%02d]", local_tm_buf.tm_hour, local_tm_buf.tm_min, local_tm_buf.tm_sec);
+                    const std::string history_line = std::string(time_prefix) + " " + it->message;
+                    overlay_paragraph(history_line.c_str(), is_fa);
+                    ImGui::Separator();
+                }
+            }
+        }
+
+        // -------------------- تب ۴: تنظیمات (شامل انتخاب زبان فارسی) --------------------
+        else if (active_page == OverlayPage::Settings) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 1.0f, 1.0f));
+            overlay_paragraph(is_fa ? "تنظیمات کلی شبیه‌ساز و زبان رابط کاربری"
+                : translationGlobalSettingsWindowDescription[current_language], is_fa);
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+
+            overlay_line(tr_ui(current_language, translationUsername, "نام کاربری"), is_fa);
+            const float settings_field_width = std::min(360.0f, ImGui::GetContentRegionAvail().x);
+            if (is_fa) align_overlay_item_right(settings_field_width);
+            ImGui::SetNextItemWidth(settings_field_width);
+            ImGui::InputText("##username", username_text, sizeof(username_text), 0);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            overlay_line(tr_ui(current_language, translationLanguage, "زبان"), is_fa);
+            const auto language_name = [](int index) {
+                return overlay_label(index, valid_languages[index], "فارسی");
+            };
+            if (is_fa) align_overlay_item_right(settings_field_width);
+            ImGui::SetNextItemWidth(settings_field_width);
+            if (ImGui::BeginCombo("##language", language_name(current_language))) {
+                ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(is_fa ? 1.0f : 0.0f, 0.5f));
+                for (int index = 0; index < static_cast<int>(std::size(valid_languages)); ++index) {
+                    if (ImGui::Selectable(language_name(index), index == current_language)) current_language = index;
+                }
+                ImGui::PopStyleVar();
+                ImGui::EndCombo();
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            overlay_paragraph(is_fa ? "برای اعمال کامل تنظیمات بازی را دوباره باز کنید."
+                : translationRestartTheGameToApply[current_language], is_fa);
+            ImGui::PopStyleColor();
+            if (overlay_button(tr_ui(current_language, translationSave, "ذخیره تنظیمات"), is_fa)) {
+                save_settings = true;
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            render_overlay_controls();
+        }
+
+        ImGui::EndChild();
+
+        if (wide && is_fa) {
+            ImGui::SameLine();
+            render_sidebar();
+        }
+        for (auto &[friend_info, state] : friends) {
+            if (overlay_peer_visible(discovery, friend_info.id())) build_friend_window(friend_info, state);
+        }
+
+        // نمایش پنجره URL در صورت فراخوانی از سوی بازی
         if (show_url.size()) {
             std::string url = show_url;
-            bool show = true;
+            bool url_open = true;
             ImGui::SetNextWindowBgAlpha(1.0f);
-            if (ImGui::Begin(URL_WINDOW_NAME, &show)) {
-                ImGui::Text("%s", translationSteamOverlayURL[current_language]);
+            if (ImGui::Begin(URL_WINDOW_NAME, &url_open)) {
+                ImGui::Text("%s", tr_ui(current_language, translationSteamOverlayURL, "آدرس وب:"));
                 ImGui::Spacing();
-
                 ImGui::PushItemWidth(ImGui::CalcTextSize(url.c_str()).x + 20);
-                ImGui::InputText("##url_copy", (char *)url.data(), url.size(), ImGuiInputTextFlags_ReadOnly);
+                ImGui::InputText("##url_copy", url.data(), url.size() + 1, ImGuiInputTextFlags_ReadOnly);
                 ImGui::PopItemWidth();
-
                 ImGui::Spacing();
-                if (ImGui::Button(translationClose[current_language]) || !show)
+                if (ImGui::Button(tr_ui(current_language, translationClose, "بستن")) || !url_open)
                     show_url = "";
-                // ImGui::SetWindowSize(ImVec2(ImGui::CalcTextSize(url.c_str()).x + 10, 0));
             }
-
             ImGui::End();
         }
 
+        // پنجره هشدار در صورت AppID=0 یا ذخیره محلی
         bool show_warning = warn_local_save || warn_bad_appid;
         if (show_warning) {
-            ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 32, ImGui::GetFontSize() * 32), ImVec2(8192, 8192));
-            ImGui::SetNextWindowFocus();
             ImGui::SetNextWindowBgAlpha(1.0f);
-            if (ImGui::Begin(translationWarning[current_language], &show_warning)) {
+            if (ImGui::Begin(tr_ui(current_language, translationWarning, "هشدار"), &show_warning)) {
                 if (warn_bad_appid) {
-                    ImGui::TextColored(ImVec4(255, 0, 0, 255),
-                        "%s %s %s",
-                        translationWarning[current_language], translationWarning[current_language], translationWarning[current_language]);
-                    ImGui::TextWrapped("%s", translationWarningDescription_badAppid[current_language]);
-                    ImGui::TextColored(ImVec4(255, 0, 0, 255),
-                        "%s %s %s",
-                        translationWarning[current_language], translationWarning[current_language], translationWarning[current_language]);
+                    ImGui::TextWrapped("%s", tr_ui(current_language, translationWarningDescription_badAppid, "هشدار: AppID بازی صفر است!"));
                 }
                 if (warn_local_save) {
-                    ImGui::TextColored(ImVec4(255, 0, 0, 255),
-                        "%s %s %s",
-                        translationWarning[current_language], translationWarning[current_language], translationWarning[current_language]);
-                    ImGui::TextWrapped("%s", translationWarningDescription_localSave[current_language]);
-                    ImGui::TextColored(ImVec4(255, 0, 0, 255),
-                        "%s %s %s",
-                        translationWarning[current_language], translationWarning[current_language], translationWarning[current_language]);
+                    ImGui::TextWrapped("%s", tr_ui(current_language, translationWarningDescription_localSave, "هشدار: ذخیره‌سازی محلی فعال است."));
                 }
             }
-
             ImGui::End();
-            // if button closed, don't show the warning again
             if (!show_warning) {
                 warn_local_save = false;
                 warn_bad_appid = false;
@@ -2422,19 +2785,21 @@ void Steam_Overlay::render_main_window()
 
     ImGui::End();
 
-    if (style_color_stack) ImGui::PopStyleColor(style_color_stack);
+    ImGui::PopStyleVar(6);
+    ImGui::PopStyleColor(style_color_stack);
     ImGui::PopFont();
 
     if (!show) {
         ShowOverlay(false);
     }
-
 }
-
 void Steam_Overlay::load_next_ach_icon()
 {
     // this function only works when icons pagination is active, request-based loading is not supported too (pagination=0)
     if (!settings->overlay_upload_achs_icons_to_gpu || settings->paginated_achievements_icons <= 0 || achievements.empty()) return;
+
+    std::unique_lock client_lock(global_mutex, std::try_to_lock);
+    if (!client_lock) return;
 
     size_t linear_idx = last_loaded_ach_icon / 2; // 2 icons per achievement, 1 achieved, 1 unachieved
     if (linear_idx >= achievements.size()) {
@@ -2466,22 +2831,23 @@ void Steam_Overlay::load_next_ach_icon()
 
 void Steam_Overlay::SetupOverlay()
 {
-    if (settings->disable_overlay) return;
+    if (settings->disable_overlay) {
+        log_overlay_startup("Overlay disabled. Check enable_experimental_overlay in configs.overlay.ini.");
+        return;
+    }
 
     PRINT_DEBUG_ENTRY();
-    std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
+    std::lock_guard lifecycle_lock(overlay_lifecycle_mutex);
+    if (setup_overlay_called.exchange(true)) return;
 
-    bool not_called_yet = false;
-    if (setup_overlay_called.compare_exchange_weak(not_called_yet, true)) {
-        if (settings->overlay_hook_delay_sec > 0) {
-            PRINT_DEBUG("waiting %i seconds", settings->overlay_hook_delay_sec);
-            renderer_detector_delay_thread.start();
-        } else {
-            // "HITMAN 3" fails if the detector was started later (after a delay)
-            // so request the renderer detector immediately (the old behavior)
-            request_renderer_detector();
-            renderer_hook_init_thread.start();
-        }
+    log_overlay_startup("Overlay starting. Waiting for renderer detection.");
+    if (settings->overlay_hook_delay_sec > 0) {
+        PRINT_DEBUG("waiting %i seconds", settings->overlay_hook_delay_sec);
+        renderer_detector_delay_thread.start();
+    } else {
+        // Some games require renderer detection to start before returning from SteamAPI_Init.
+        request_renderer_detector();
+        renderer_hook_init_thread.start();
     }
 }
 
@@ -2490,72 +2856,78 @@ void Steam_Overlay::UnSetupOverlay()
     if (settings->disable_overlay) return;
 
     PRINT_DEBUG_ENTRY();
-    std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
+    std::lock_guard lifecycle_lock(overlay_lifecycle_mutex);
+    if (!setup_overlay_called.exchange(false)) return;
 
-    bool already_called = true;
-    if (setup_overlay_called.compare_exchange_weak(already_called, false)) {
-        is_ready = false;
+    // The delayed worker can still start the initialization worker.
+    // Both workers must be idle before taking overlay_mutex and tearing down the renderer.
+    renderer_detector_delay_thread.kill();
+    renderer_hook_init_thread.kill();
 
-        renderer_hook_init_thread.kill();
-        renderer_detector_delay_thread.kill();
+    std::lock_guard lock(overlay_mutex);
+    is_ready = false;
+    renderer_hook_installed = false;
+    late_init_imgui = false;
+    show_overlay = false;
+    overlay_requested = false;
+    overlay_state_changed = false;
+    startup_ready_logged = false;
 
-        // stop internal frame processing & restore cursor
-        if (_renderer) {
-            // for some reason this gets triggered after the overlay instance has been destroyed
-            // I assume because the game de-initializes DX later after closing Steam APIs
-            // this hacky solution just sets it to an empty function
-            _renderer->OverlayHookReady = [](InGameOverlay::OverlayHookState){};
-            _renderer->OverlayProc = [](){};
+    if (_renderer) {
+        // Some games release the graphics device after shutting down Steamworks.
+        _renderer->OverlayHookReady = [](InGameOverlay::OverlayHookState){};
+        _renderer->OverlayProc = [](){};
+        _renderer->SetScreenshotCallback(nullptr, nullptr);
 
-            allow_renderer_frame_processing(false, true);
-            obscure_game_input(false);
+        allow_renderer_frame_processing(false, true);
+        obscure_game_input(false);
 
-            PRINT_DEBUG("releasing any images resources");
-            for (auto &ach : achievements) {
-                if (ach.icon->GetResourceId() != 0) {
-                    ach.icon->Unload();
-                }
-
-                if (ach.icon_gray->GetResourceId() != 0) {
-                    ach.icon_gray->Unload();
-                }
+        for (auto &ach : achievements) {
+            for (auto *resource : {ach.icon, ach.icon_gray}) {
+                if (!resource) continue;
+                if (resource->GetResourceId() != 0) resource->Unload();
+                resource->Delete();
             }
-
-            // Unload screenshot textures
-            for (auto &item : screenshot_items) {
-                if (item.texture) {
-                    if (item.texture->GetResourceId() != 0)
-                        item.texture->Unload();
-                    item.texture->Delete();
-                }
-            }
-            screenshot_items.clear();
-            preview_pixels.clear();
-            preview_pixels_w = 0;
-            preview_pixels_h = 0;
-            if (preview_texture) {
-                if (preview_texture->GetResourceId() != 0)
-                    preview_texture->Unload();
-                preview_texture->Delete();
-                preview_texture = nullptr;
-            }
-            unpin_all_screenshots();
-
-            // manually calling this dtor looks bad, but it actually prevents a lot of crashes on exit, don't remove it!
-            // many DX12 games will crash on exit if the hook wasn't manually removed (ex appid 2933080, 1583230)
-            _renderer->~RendererHook_t();
-            _renderer = nullptr;
         }
 
-        cleanup_renderer_hook();
+        for (auto &item : screenshot_items) {
+            if (item.texture) {
+                if (item.texture->GetResourceId() != 0) item.texture->Unload();
+                item.texture->Delete();
+            }
+        }
+        screenshot_items.clear();
+        preview_pixels.clear();
+        preview_pixels_w = 0;
+        preview_pixels_h = 0;
+        if (preview_texture) {
+            if (preview_texture->GetResourceId() != 0) preview_texture->Unload();
+            preview_texture->Delete();
+            preview_texture = nullptr;
+        }
+        unpin_all_screenshots();
+
+        // Remove the hook before DX12 game shutdown or the process can crash (appid 2933080, 1583230).
+        _renderer->~RendererHook_t();
+        _renderer = nullptr;
     }
+
+    renderer_frame_processing_requests = 0;
+    obscure_cursor_requests = 0;
+    achievements.clear();
+    achievement_queue.clear();
+    notifications.clear();
+    last_loaded_ach_icon = 0;
+    fonts_atlas.Clear();
+    cleanup_renderer_hook();
+    log_overlay_startup("Overlay stopped.");
 
     PRINT_DEBUG("done *********");
 }
 
 bool Steam_Overlay::Ready() const
 {
-    return !settings->disable_overlay && is_ready && late_init_imgui;
+    return setup_overlay_called && is_ready && late_init_imgui;
 }
 
 bool Steam_Overlay::NeedPresent() const
@@ -2589,7 +2961,7 @@ void Steam_Overlay::OpenOverlayInvite(CSteamID lobbyId)
 {
     PRINT_DEBUG("%llu", lobbyId.ConvertToUint64());
     std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
-    if (!Ready()) return;
+    if (!setup_overlay_called) return;
 
     // remember the lobby the game wants the invitations to be sent to,
     // the actual invite happens later when the user clicks "invite" on a friend
@@ -2601,12 +2973,12 @@ void Steam_Overlay::OpenOverlayInvite(CSteamID lobbyId)
 
 void Steam_Overlay::OpenOverlay(const char* pchDialog)
 {
-    PRINT_DEBUG("TODO '%s'", pchDialog);
+    PRINT_DEBUG("TODO '%s'", pchDialog ? pchDialog : "");
     std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
-    if (!Ready()) return;
+    if (!setup_overlay_called) return;
 
     // TODO: Show pages depending on pchDialog
-    if ((strncmp(pchDialog, "Friends", sizeof("Friends") - 1) == 0) && (settings->overlayAutoAcceptInvitesCount() > 0)) {
+    if (pchDialog && (strncmp(pchDialog, "Friends", sizeof("Friends") - 1) == 0) && (settings->overlayAutoAcceptInvitesCount() > 0)) {
         PRINT_DEBUG("won't open overlay's friends list because some friends are defined in the auto accept list");
         add_auto_accept_invite_notification();
     } else {
@@ -2616,9 +2988,10 @@ void Steam_Overlay::OpenOverlay(const char* pchDialog)
 
 void Steam_Overlay::OpenOverlayWebpage(const char* pchURL)
 {
+    if (!pchURL) return;
     PRINT_DEBUG("TODO '%s'", pchURL);
     std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
-    if (!Ready()) return;
+    if (!setup_overlay_called) return;
 
     show_url = pchURL;
     ShowOverlay(true);
@@ -2631,17 +3004,7 @@ bool Steam_Overlay::ShowOverlay() const
 
 void Steam_Overlay::ShowOverlay(bool state)
 {
-    std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
-    if (!Ready() || show_overlay == state) return;
-
-    show_overlay = state;
-    overlay_state_changed = true;
-
-    PRINT_DEBUG("%i", (int)state);
-
-    Steam_Overlay::allow_renderer_frame_processing(state);
-    Steam_Overlay::obscure_game_input(state);
-
+    if (setup_overlay_called) overlay_requested = state;
 }
 
 void Steam_Overlay::SetLobbyInvite(Friend friendId, uint64 lobbyId)
@@ -2728,6 +3091,7 @@ void Steam_Overlay::AddAchievementNotification(const std::string &ach_name, nloh
     if (settings->disable_overlay) return;
 
     PRINT_DEBUG("'%s' %i", ach_name.c_str(), (int)for_progress);
+    std::lock_guard client_lock(global_mutex);
     std::lock_guard<std::recursive_mutex> lock(overlay_mutex);
 
     // Phase 1: Update achievement data regardless of Ready() state.
@@ -2736,9 +3100,6 @@ void Steam_Overlay::AddAchievementNotification(const std::string &ach_name, nloh
     for (auto &a : achievements) {
         if (a.name == ach_name) {
             try {
-                // lock to prevent modifications to this json object
-                std::lock_guard<std::recursive_mutex> lock2(global_mutex);
-
                 a.achieved = ach.value("earned", false);
                 a.unlock_time = ach.value("earned_time", static_cast<uint32>(0));
                 a.progress = ach.value("progress", static_cast<uint32>(0));
@@ -2912,7 +3273,13 @@ void Steam_Overlay::steam_run_callback_friends_actions()
 
 void Steam_Overlay::steam_run_callback()
 {
-    if (!Ready()) return;
+    std::unique_lock lock(overlay_mutex, std::try_to_lock);
+    if (!lock || !Ready()) return;
+
+    if (!startup_ready_logged) {
+        startup_ready_logged = true;
+        log_overlay_startup("Overlay rendered its first frame.");
+    }
 
     if (overlay_state_changed) {
         overlay_state_changed = false;
@@ -2928,9 +3295,7 @@ void Steam_Overlay::steam_run_callback()
     Steam_Friends* steamFriends = get_steam_client()->steam_friends;
     Steam_Matchmaking* steamMatchmaking = get_steam_client()->steam_matchmaking;
 
-    if (save_settings) {
-        save_settings = false;
-
+    if (save_settings.exchange(false)) {
         const char *language_text = valid_languages[current_language];
         save_global_settings(get_steam_client()->local_storage, username_text, language_text);
         get_steam_client()->settings_client->set_local_name(username_text);
@@ -2940,36 +3305,23 @@ void Steam_Overlay::steam_run_callback()
         steamFriends->resend_friend_data();
     }
 
+    displayed_local_name = settings->get_local_name();
+    displayed_app_id = settings->get_local_game_id().AppID();
     steam_run_callback_update_my_lobby();
 
-    // if variable == true, then set it to false and return true (because state was changed) in that case
-    bool yes_clicked = true;
-    if (invite_all_friends_clicked.compare_exchange_weak(yes_clicked, false)) {
+    if (invite_all_friends_clicked.exchange(false)) {
         PRINT_DEBUG("Steam_Overlay will send invitations to [%zu] friends if they're using the same app", friends.size());
         uint32 current_appid = settings->get_local_game_id().AppID();
+        const auto discovery = network->peer_discovery_snapshot();
         for (auto &fr : friends) {
-            if (fr.first.appid() == current_appid) { // friend is playing the same game
+            if (fr.first.appid() == current_appid && overlay_peer_visible(discovery, fr.first.id())) {
                 uint64 friend_id = (uint64)fr.first.id();
                 invite_friend(friend_id, steamFriends, steamMatchmaking);
             }
         }
     }
 
-    // don't wait to lock the overlay mutex
-    // * the overlay proc might be active and holding the overlay mutex
-    // * this steam callback will be blocked, but it has the global mutex locked
-    // * the overlay proc tries to lock the global mutex, but since we have it, it will be blocked forever
-    if (overlay_mutex.try_lock()) {
-        if (Ready()) {
-            // ==============================================================
-            // call steam callbacks that has to change the overlay state here
-            // ==============================================================
-
-            steam_run_callback_friends_actions();
-        }
-
-        overlay_mutex.unlock();
-    }
+    steam_run_callback_friends_actions();
 }
 
 

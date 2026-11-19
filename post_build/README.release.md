@@ -22,6 +22,14 @@ Mr.Goldberg's note:
 
 ---
 
+## Windows LAN tools
+
+The experimental SteamEM Overlay opens with **Shift+Tab**. Choose **Network** and enter the other player's IPv4 address and discovery port in separate fields. The port defaults to `47584`. Automatic discovery starts off for each game session. You can enable it in the same tab to search LAN addresses in addition to your saved peers.
+
+The `epic` folder contains the **Epic LAN** launcher. It opens games and dedicated servers that support native LAN or direct-IP multiplayer. Save the game server's IPv4 address and port under **Servers**. Select the server and insert `{endpoint}` in the launch arguments where the title expects a direct-connect address, or use the game's own LAN browser.
+
+---
+
 ## Various configurations:
 Due to the various changes and additions, it became tedious to document everything,  
 so it is recommended to check each example file in the `steam_settings` folder, and the various options inside `configs.xxx.ini`.

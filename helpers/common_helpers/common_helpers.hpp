@@ -28,6 +28,7 @@ private:
 
     std::function<bool(void *)> thread_job;
 
+    std::mutex lifecycle_mutex{};
     std::mutex kill_thread_mutex{};
     std::condition_variable kill_thread_cv{};
     bool kill_thread{};

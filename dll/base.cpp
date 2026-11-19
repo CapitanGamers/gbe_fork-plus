@@ -398,20 +398,39 @@ struct ips_test {
 };
 
 static std::vector<struct ips_test> whitelist_ips;
+static std::set<uint32_t> discovery_peer_ips;
+static std::mutex whitelist_mtx;
+
+void set_discovery_peer_ips(std::set<uint32_t> ip_addresses)
+{
+    const std::lock_guard lock(whitelist_mtx);
+    discovery_peer_ips = std::move(ip_addresses);
+}
+
+void add_whitelist_ip_range(uint32_t ip_from_host, uint32_t ip_to_host)
+{
+    if (ip_to_host < ip_from_host) std::swap(ip_from_host, ip_to_host);
+    std::lock_guard<std::mutex> lck(whitelist_mtx);
+    for (const auto &existing : whitelist_ips) {
+        if (existing.ip_from <= ip_from_host && existing.ip_to >= ip_to_host) return;
+    }
+    whitelist_ips.push_back({ip_from_host, ip_to_host});
+}
 
 void set_whitelist_ips(uint32_t *from, uint32_t *to, unsigned num_ips)
 {
-    whitelist_ips.clear();
+    std::lock_guard<std::mutex> lck(whitelist_mtx);
     for (unsigned i = 0; i < num_ips; ++i) {
         struct ips_test ip_a;
-        PRINT_DEBUG("from: %hhu.%hhu.%hhu.%hhu", ((unsigned char *)&from[i])[0], ((unsigned char *)&from[i])[1], ((unsigned char *)&from[i])[2], ((unsigned char *)&from[i])[3]);
-        PRINT_DEBUG("to: %hhu.%hhu.%hhu.%hhu", ((unsigned char *)&to[i])[0], ((unsigned char *)&to[i])[1], ((unsigned char *)&to[i])[2], ((unsigned char *)&to[i])[3]);
         ip_a.ip_from = ntohl(from[i]);
         ip_a.ip_to = ntohl(to[i]);
-        if (ip_a.ip_to < ip_a.ip_from) continue;
-        if ((ip_a.ip_to - ip_a.ip_from) > (1 << 25)) continue;
-        PRINT_DEBUG("added ip to whitelist");
-        whitelist_ips.push_back(ip_a);
+        if (ip_a.ip_to < ip_a.ip_from) std::swap(ip_a.ip_from, ip_a.ip_to);
+        if ((ip_a.ip_to - ip_a.ip_from) > (1u << 25)) continue;
+        bool exists = false;
+        for (const auto &ex : whitelist_ips) {
+            if (ex.ip_from == ip_a.ip_from && ex.ip_to == ip_a.ip_to) { exists = true; break; }
+        }
+        if (!exists) whitelist_ips.push_back(ip_a);
     }
 }
 
@@ -420,31 +439,25 @@ static bool is_whitelist_ip(unsigned char *ip)
     uint32_t ip_temp = 0;
     memcpy(&ip_temp, ip, sizeof(ip_temp));
     ip_temp = ntohl(ip_temp);
-
-    for (auto &i : whitelist_ips) {
-        if (i.ip_from <= ip_temp && ip_temp <= i.ip_to) {
-            PRINT_DEBUG("IP IS WHITELISTED %hhu.%hhu.%hhu.%hhu", ip[0], ip[1], ip[2], ip[3]);
-            return true;
-        }
+    std::lock_guard<std::mutex> lck(whitelist_mtx);
+    if (discovery_peer_ips.count(ip_temp)) return true;
+    for (const auto &i : whitelist_ips) {
+        if (i.ip_from <= ip_temp && ip_temp <= i.ip_to) return true;
     }
-
     return false;
 }
 
 static bool is_lan_ipv4(unsigned char *ip)
 {
-    PRINT_DEBUG("CHECK LAN IP %hhu.%hhu.%hhu.%hhu", ip[0], ip[1], ip[2], ip[3]);
     if (is_whitelist_ip(ip)) return true;
-    if (ip[0] == 127) return true;
-    if (ip[0] == 10) return true;
+    if (ip[0] == 127 || ip[0] == 10 || ip[0] == 26 || ip[0] == 25 || ip[0] == 0) return true;
     if (ip[0] == 192 && ip[1] == 168) return true;
-    if (ip[0] == 169 && ip[1] == 254 && ip[2] != 0) return true;
+    if (ip[0] == 169 && ip[1] == 254) return true;
     if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) return true;
     if ((ip[0] == 100) && ((ip[1] & 0xC0) == 0x40)) return true;
-    if (ip[0] == 239) return true; //multicast
-    if (ip[0] == 0) return true; //Current network
-    if (ip[0] == 192 && (ip[1] == 18 || ip[1] == 19)) return true; //Used for benchmark testing of inter-network communications between two separate subnets.
-    if (ip[0] >= 224) return true; //ip multicast (224 - 239) future use (240.0.0.0 - 255.255.255.254) broadcast (255.255.255.255)
+    if (ip[0] == 198 && (ip[1] == 18 || ip[1] == 19)) return true;
+    if (ip[0] == 192 && (ip[1] == 18 || ip[1] == 19)) return true;
+    if (ip[0] >= 224) return true;
     return false;
 }
 
@@ -739,7 +752,10 @@ struct CppRuntimeTrick {
 
 void set_whitelist_ips(uint32_t *from, uint32_t *to, unsigned num_ips)
 {
+}
 
+void add_whitelist_ip_range(uint32_t ip_from_host, uint32_t ip_to_host)
+{
 }
 
 #endif // __WINDOWS__
@@ -748,7 +764,16 @@ void set_whitelist_ips(uint32_t *from, uint32_t *to, unsigned num_ips)
 
 void set_whitelist_ips(uint32_t *from, uint32_t *to, unsigned num_ips)
 {
+}
 
+void add_whitelist_ip_range(uint32_t ip_from_host, uint32_t ip_to_host)
+{
 }
 
 #endif // EMU_EXPERIMENTAL_BUILD
+
+#if !defined(EMU_EXPERIMENTAL_BUILD) || !defined(__WINDOWS__)
+void set_discovery_peer_ips(std::set<uint32_t>)
+{
+}
+#endif

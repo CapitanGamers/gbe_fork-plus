@@ -788,6 +788,42 @@ if _OPTIONS["build-protobuf"] or _OPTIONS["all-build"] then
 end
 
 if _OPTIONS["build-ingame_overlay"] or _OPTIONS["all-build"] then
+    local overlay_dir = path.join(deps_dir, 'ingame_overlay')
+    local windows_overlay = os.target() == 'windows'
+    if windows_overlay then
+        local dx11_path = path.join(overlay_dir, 'src', 'Windows', 'DX11Hook.cpp')
+        local file = assert(io.open(dx11_path, 'rb'))
+        local source = file:read('*a'):gsub('\r\n', '\n')
+        file:close()
+
+        if not source:find('SteamEMOverlayFrameScope', 1, true) then
+            local function replace_dx11_code(old, new)
+                local first, last = source:find(old, 1, true)
+                if not first then error('unexpected DX11 overlay source: ' .. dx11_path) end
+                source = source:sub(1, first - 1) .. new .. source:sub(last + 1)
+            end
+
+            replace_dx11_code('namespace InGameOverlay {\n', [=[
+namespace InGameOverlay {
+
+namespace {
+thread_local unsigned overlay_frame_depth = 0;
+
+struct SteamEMOverlayFrameScope {
+    SteamEMOverlayFrameScope() { ++overlay_frame_depth; }
+    ~SteamEMOverlayFrameScope() { --overlay_frame_depth; }
+};
+}
+]=])
+            replace_dx11_code('    if (flags & DXGI_PRESENT_TEST)\n        return;\n\n    DXGI_SWAP_CHAIN_DESC desc;',
+                '    if (flags & DXGI_PRESENT_TEST)\n        return;\n\n    const SteamEMOverlayFrameScope frame_scope;\n    DXGI_SWAP_CHAIN_DESC desc;')
+            -- Texture updates can release the device while ImGui is still drawing.
+            replace_dx11_code('if (inst->_DeviceReleasing == 0 && result <= inst->_HookDeviceRefCount)',
+                'if (overlay_frame_depth == 0 && inst->_DeviceReleasing == 0 && result <= inst->_HookDeviceRefCount)')
+            assert(io.writefile(dx11_path, source), 'failed to patch ' .. dx11_path)
+        end
+    end
+
     -- fixes 32-bit compilation of DX12
     local overaly_imgui_cfg_file = path.join(deps_dir, 'ingame_overlay', 'imconfig.imcfg')
     if not io.writefile(overaly_imgui_cfg_file, [[
@@ -818,6 +854,14 @@ if _OPTIONS["build-ingame_overlay"] or _OPTIONS["all-build"] then
         end
     end
 
+    local function build_ingame_overlay(arch)
+        cmake_build('ingame_overlay', arch, ingame_overlay_common_defs, nil, ingame_overlay_fixes)
+        if windows_overlay then
+            local stamp = path.join(overlay_dir, 'install' .. arch, 'steamem-dx11-lifetime.txt')
+            assert(io.writefile(stamp, '1\n'), 'failed to write ' .. stamp)
+        end
+    end
+
     if _OPTIONS["32-build"] then
         cmake_build('ingame_overlay/deps/System', "32", {
             'SYSTEM_BUILD_TESTS=OFF',
@@ -827,7 +871,7 @@ if _OPTIONS["build-ingame_overlay"] or _OPTIONS["all-build"] then
             'MINIDETOUR_BUILD_TESTS=OFF',
             'MINIDETOUR_DYNAMIC_RUNTIME=OFF',
         })
-        cmake_build('ingame_overlay', "32", ingame_overlay_common_defs, nil, ingame_overlay_fixes)
+        build_ingame_overlay("32")
     end
     if _OPTIONS["64-build"] then
         cmake_build('ingame_overlay/deps/System', "64", {
@@ -838,7 +882,7 @@ if _OPTIONS["build-ingame_overlay"] or _OPTIONS["all-build"] then
             'MINIDETOUR_BUILD_TESTS=OFF',
             'MINIDETOUR_DYNAMIC_RUNTIME=OFF',
         })
-        cmake_build('ingame_overlay', "64", ingame_overlay_common_defs, nil, ingame_overlay_fixes)
+        build_ingame_overlay("64")
     end
     if _OPTIONS["arm-build"] then
         cmake_build('ingame_overlay/deps/System', "arm", {
@@ -849,7 +893,7 @@ if _OPTIONS["build-ingame_overlay"] or _OPTIONS["all-build"] then
             'MINIDETOUR_BUILD_TESTS=OFF',
             'MINIDETOUR_DYNAMIC_RUNTIME=OFF',
         })
-        cmake_build('ingame_overlay', "arm", ingame_overlay_common_defs, nil, ingame_overlay_fixes)
+        build_ingame_overlay("arm")
     end
 end
 
