@@ -4,7 +4,7 @@
 
 SteamEM implements selected Steamworks services locally so players can discover one another, host a lobby, and join supported games without reaching Steam's online services. Each player runs their own copy of the game. The LAN or VPN provides the route between them.
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [Build from source](#build-from-source) · [Troubleshooting](#troubleshooting) · [Persian guide](README.fa.md)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Build from source](#build-from-source) · [Troubleshooting](#troubleshooting) · [Persian guide](READMEfa.md)
 
 ## What works today
 
