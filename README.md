@@ -33,7 +33,7 @@ Compatibility depends on the game, its version, and the interfaces it uses. Game
 4. **Find a peer.** Connect both PCs to the same LAN or private VPN, start the game, and press `Shift+Tab`. Open **Network**, enter the other player's IPv4 address and the **UDP** port shown in their overlay, then select **Find friend**. Leave the port blank for `47584`. You can add peers while the game is running.
 5. **Start the session.** Create or join a lobby through the game's multiplayer menu. To manage addresses before launch, open **Peers** in `SteamEM_x64.exe` or `SteamEM_x86.exe` under `tools/steamem_launcher/`.
 
-![SteamEM's Windows overlay showing Friends, Network, Achievements, History, and Settings](docs/overlay-preview.png)
+![SteamEM's Windows overlay showing Friends, Network, Achievements, History, and Settings](overlay-preview.png)
 
 ## How it works
 
